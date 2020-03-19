@@ -88,20 +88,19 @@ fn onramp_loop(
         thread::sleep(Duration::from_millis(config.interval));
         let mut ingest_ns = nanotime();
 
-        let (metric_type, metrics) = match &config.metric as &str {
-            SYS_METRIC => SysInfo::get_metric(),
-            PROC_METRIC => ProcInfo::get_metric(),
-            MOUNT_METRIC => MountInfo::get_metric(),
-            _ => SysInfo::get_metric(),
+        let metrics = match &config.metric as &str {
+            SYS_METRIC => SysInfo::get_metrics(),
+            PROC_METRIC => ProcInfo::get_metrics(),
+            MOUNT_METRIC => MountInfo::get_metrics(),
+            _ => SysInfo::get_metrics(),
         };
 
         for metric in &metrics {
             let data = serde_json::to_vec(&json!({
                 "headers": {
-                    "onramp": "osmetric",
                     "hostname": host_name,
-                    "metric": metric_type,
-                    "ingest_ns": ingest_ns, 
+                    "metric": config.metric,
+                    "ts": (ingest_ns / 1000000) as i64, 
                 },
                 "body": metric
             }));
@@ -187,7 +186,7 @@ impl MountInfo {
         }
     }
 
-    pub fn get_metric() -> (String, Vec<String>) {
+    pub fn get_metrics() -> Vec<String> {
         let mut metrics: Vec<String> = Vec::new();
         match MountIter::new() {
             Ok(mount_iter) => {
@@ -216,7 +215,7 @@ impl MountInfo {
                 error!("Error reading mount info: {}", err);
             }
         }
-        ("mount".to_string(), metrics)
+        metrics
     }
 
     pub fn to_string(&self) -> String {                                        
@@ -303,14 +302,14 @@ impl ProcInfo {
         }
     }
 
-    pub fn get_metric() -> (String, Vec<String>) {
+    pub fn get_metrics() ->  Vec<String> {
         let mut metrics: Vec<String> = Vec::new();
         for process in procfs::all_processes() {
             let proc_info = ProcInfo::new(&process);
             metrics.push(proc_info.to_string())
         }
 
-        ("proc".to_string(), metrics)
+        metrics
     }
 
     pub fn to_string(&self) -> String {                                        
@@ -363,11 +362,11 @@ impl SysInfo {
         }
     }
 
-    pub fn get_metric() -> (String, Vec<String>) {
+    pub fn get_metrics() -> Vec<String> {
         let sys_info = SysInfo::new();
         let mut metrics = Vec::new();
         metrics.push(sys_info.to_string());
-        ("sys".to_string(), metrics)
+        metrics
     }
 
     pub fn to_string(&self) -> String {                                        
