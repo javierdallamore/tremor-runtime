@@ -24,6 +24,7 @@ lto = true
 opt-level = 3
 
 [dependencies]
+quote = "=1.0.1"
 async-std = {version = "1.5", features = ["unstable"]}
 async-trait = "0.1"
 base64 = "0.12"
@@ -97,6 +98,11 @@ hyper = "0.10"  # chan't update this because of google
 grok = "1"
 
 snmalloc-rs = { version = "0.2", optional = true }
+
+# stats
+libc = "0.2.53"
+procfs = "0.5.3"
+proc-mounts = "0.2.2"
 
 [dependencies.tungstenite]
 version = "0.10"
