@@ -91,7 +91,7 @@ google-pubsub1 = "1"
 hyper-rustls = "0.6" # chan't update this because of google
 yup-oauth2 = "1" # can't update this because of google
 
-hyper = "0.10"  # chan't update this because of google
+hyper = "0.12"  # chan't update this because of google
 
 # logstash grok patterns
 grok = "1"
