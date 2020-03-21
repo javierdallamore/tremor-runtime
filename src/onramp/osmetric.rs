@@ -55,11 +55,18 @@ impl onramp::Impl for OSMetric {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum MetricType {
     Sys,
     Proc,
-    Mount
+    Mount,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum Metric {
+    Sys(SysInfo),
+    Proc(ProcInfo),
+    Mount(MountInfo),
 }
 
 fn onramp_loop(
@@ -91,10 +98,10 @@ fn onramp_loop(
         let mut ingest_ns = nanotime();
         let ts = (ingest_ns / 1000000) as i64;
 
-        let metrics: Vec<_> = match config.metric {
+        let metrics: Vec<Metric> = match config.metric {
             MetricType::Sys => SysInfo::get_metrics(),
-            MetricType::Proc => SysInfo::get_metrics(),
-            MetricType::Mount => SysInfo::get_metrics(),
+            MetricType::Proc => ProcInfo::get_metrics(),
+            MetricType::Mount => MountInfo::get_metrics(),
         };
 
         for metric in &metrics {
@@ -144,7 +151,7 @@ impl Onramp for OSMetric {
 }
 
 // MountInfo
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MountInfo {
     source: String,
     dest: String,
@@ -183,9 +190,8 @@ impl MountInfo {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn get_metrics() -> Vec<MountInfo> {
-        let mut metrics: Vec<MountInfo> = Vec::new();
+    pub fn get_metrics() -> Vec<Metric> {
+        let mut metrics = Vec::new();
         match MountIter::new() {
             Ok(mount_iter) => {
                 for mount in mount_iter {
@@ -201,7 +207,7 @@ impl MountInfo {
                             let mount_info = MountInfo::new(
                                 source, dest, &fstype, &options, dump, pass,
                             );
-                            metrics.push(mount_info);
+                            metrics.push(Metric::Mount(mount_info));
                         }
                         Err(err) => {
                             error!("Error reading mount info: {}", err);
@@ -253,7 +259,7 @@ pub fn fs_usage(mount_point: &str) -> (u64, u64, u64, u32) {
 }
 
 // ProcInfo
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProcInfo {
     pid: i32,
     owner: u32,
@@ -295,19 +301,18 @@ impl ProcInfo {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn get_metrics() ->  Vec<ProcInfo> {
+    pub fn get_metrics() ->  Vec<Metric> {
         let mut metrics = Vec::new();
         for process in procfs::all_processes() {
             let proc_info = ProcInfo::new(&process);
-            metrics.push(proc_info)
+            metrics.push(Metric::Proc(proc_info))
         }
 
         metrics
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SysInfo {
     mem_total: Option<u64>,
     mem_free: Option<u64>,
@@ -352,8 +357,8 @@ impl SysInfo {
         }
     }
 
-    pub fn get_metrics() -> Vec<SysInfo> {
+    pub fn get_metrics() -> Vec<Metric> {
         let sys_info = SysInfo::new();
-        vec![sys_info]
+        vec![Metric::Sys(sys_info)]
     }
 }
