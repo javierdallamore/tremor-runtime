@@ -35,7 +35,7 @@ use proc_mounts::{self, MountIter};
 pub struct Config {
     /// Interval in milliseconds
     pub interval: u64,
-    pub metric: String,
+    pub metric: MetricType,
 }
 
 impl ConfigImpl for Config {}
@@ -55,9 +55,12 @@ impl onramp::Impl for OSMetric {
     }
 }
 
-pub const SYS_METRIC: &'static str = "sys";
-pub const PROC_METRIC: &'static str = "proc";
-pub const MOUNT_METRIC: &'static str = "mount";
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum MetricType {
+    Sys,
+    Proc,
+    Mount
+}
 
 fn onramp_loop(
     rx: &Receiver<onramp::Msg>,
@@ -69,7 +72,6 @@ fn onramp_loop(
     let mut pipelines: Vec<(TremorURL, pipeline::Addr)> = Vec::new();
     let mut id: u64 = 0;
     let host_name = hostname();
- 
 
     let origin_uri = tremor_pipeline::EventOriginUri {
         scheme: "tremor-osmetric".to_string(),
@@ -87,22 +89,18 @@ fn onramp_loop(
 
         thread::sleep(Duration::from_millis(config.interval));
         let mut ingest_ns = nanotime();
+        let ts = (ingest_ns / 1000000) as i64;
 
-        let metrics = match &config.metric as &str {
-            SYS_METRIC => SysInfo::get_metrics(),
-            PROC_METRIC => ProcInfo::get_metrics(),
-            MOUNT_METRIC => MountInfo::get_metrics(),
-            _ => SysInfo::get_metrics(),
+        let metrics: Vec<_> = match config.metric {
+            MetricType::Sys => SysInfo::get_metrics(),
+            MetricType::Proc => SysInfo::get_metrics(),
+            MetricType::Mount => SysInfo::get_metrics(),
         };
 
         for metric in &metrics {
             let data = serde_json::to_vec(&json!({
-                "headers": {
-                    "hostname": host_name,
-                    "metric": config.metric,
-                    "ts": (ingest_ns / 1000000) as i64, 
-                },
-                "body": metric
+                "headers": {"hostname": host_name, "metric": config.metric, "ts": ts},
+                "body": metric,
             }));
 
             if let Ok(data) = data {
@@ -120,7 +118,6 @@ fn onramp_loop(
 
             id += 1;
         }
-
     }
 }
 
@@ -186,8 +183,9 @@ impl MountInfo {
         }
     }
 
-    pub fn get_metrics() -> Vec<String> {
-        let mut metrics: Vec<String> = Vec::new();
+    #[allow(dead_code)]
+    pub fn get_metrics() -> Vec<MountInfo> {
+        let mut metrics: Vec<MountInfo> = Vec::new();
         match MountIter::new() {
             Ok(mount_iter) => {
                 for mount in mount_iter {
@@ -203,7 +201,7 @@ impl MountInfo {
                             let mount_info = MountInfo::new(
                                 source, dest, &fstype, &options, dump, pass,
                             );
-                            metrics.push(mount_info.to_string());
+                            metrics.push(mount_info);
                         }
                         Err(err) => {
                             error!("Error reading mount info: {}", err);
@@ -217,11 +215,6 @@ impl MountInfo {
         }
         metrics
     }
-
-    pub fn to_string(&self) -> String {                                        
-        serde_json::to_string(&self).unwrap()                                  
-    }
-
 }
 
 pub fn statvfs(mount_point: &str) -> Option<libc::statvfs> {
@@ -302,18 +295,15 @@ impl ProcInfo {
         }
     }
 
-    pub fn get_metrics() ->  Vec<String> {
-        let mut metrics: Vec<String> = Vec::new();
+    #[allow(dead_code)]
+    pub fn get_metrics() ->  Vec<ProcInfo> {
+        let mut metrics = Vec::new();
         for process in procfs::all_processes() {
             let proc_info = ProcInfo::new(&process);
-            metrics.push(proc_info.to_string())
+            metrics.push(proc_info)
         }
 
         metrics
-    }
-
-    pub fn to_string(&self) -> String {                                        
-        serde_json::to_string(&self).unwrap()                                  
     }
 }
 
@@ -362,14 +352,8 @@ impl SysInfo {
         }
     }
 
-    pub fn get_metrics() -> Vec<String> {
+    pub fn get_metrics() -> Vec<SysInfo> {
         let sys_info = SysInfo::new();
-        let mut metrics = Vec::new();
-        metrics.push(sys_info.to_string());
-        metrics
-    }
-
-    pub fn to_string(&self) -> String {                                        
-        serde_json::to_string(&self).unwrap()                                  
+        vec![sys_info]
     }
 }
