@@ -30,6 +30,7 @@ mod prelude;
 pub mod tcp;
 mod udp;
 mod osmetric;
+mod logwatcher;
 use async_std::sync::{self, channel};
 use async_std::task::{self, JoinHandle};
 use crossbeam_channel::Sender as CbSender;
@@ -76,6 +77,7 @@ pub(crate) fn lookup(name: &str, config: &Option<Value>) -> Result<Box<dyn Onram
         // "rest" => rest::Rest::from_config(config),
         "ws" => ws::Ws::from_config(config),
         "osmetric" => osmetric::OSMetric::from_config(config),
+        "logwatcher" => logwatcher::LogWatcher::from_config(config),
         _ => Err(format!("Onramp {} not known", name).into()),
     }
 }
