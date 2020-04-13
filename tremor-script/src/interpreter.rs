@@ -238,7 +238,19 @@ where
                     Lt => Ok(static_bool!(l < r)),
                     Lte => Ok(static_bool!(l <= r)),
                     Add => Ok(Cow::Owned(Value::from(l + r))),
-                    Sub => Ok(Cow::Owned(Value::from(l - r))),
+                    Sub if l >= r => Ok(Cow::Owned(Value::from(l - r))),
+                    Sub => {
+                        // Handle substraction that would turn this into a negative
+                        // to do that we calculate r-i (the inverse) and then
+                        // try to turn this into a i64 and negate it;
+                        let d = r - l;
+
+                        if let Some(res) = d.try_into().ok().and_then(i64::checked_neg) {
+                            Ok(Cow::Owned(Value::from(res)))
+                        } else {
+                            error_invalid_binary(outer, inner, *op, lhs, rhs, &node_meta)
+                        }
+                    }
                     Mul => Ok(Cow::Owned(Value::from(l * r))),
                     Div => Ok(Cow::Owned(Value::from((l as f64) / (r as f64)))),
                     Mod => Ok(Cow::Owned(Value::from(l % r))),
@@ -1189,11 +1201,13 @@ impl<'script> GroupByInt<'script> {
                 let v = expr
                     .run(opts, &env, event, state, meta, &local_stack)?
                     .into_owned();
-                if groups.is_empty() {
-                    groups.push(vec![v]);
+                if let Some((last_group, other_groups)) = groups.split_last_mut() {
+                    other_groups.iter_mut().for_each(|g| g.push(v.clone()));
+                    last_group.push(v)
                 } else {
-                    groups.iter_mut().for_each(|g| g.push(v.clone()));
-                };
+                    // No last group existed, i.e, `groups` was empty. Push a new group:
+                    groups.push(vec![v]);
+                }
                 Ok(())
             }
 

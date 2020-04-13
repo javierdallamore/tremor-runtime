@@ -164,8 +164,21 @@ fn onramp_loop(
             }
         };
 
-        let consume_from = &obj["consume_from"];
-        let consume_until = &obj["consume_until"];
+        let consume_from = if let Some(v) = obj.get("consume_from") {
+            v
+        } else {
+            metrics_reporter.increment_error();
+            warn!("Failed to fetching consume_from");
+            continue;
+        };
+
+        let consume_until = if let Some(v) = obj.get("consume_until") {
+            v
+        } else {
+            metrics_reporter.increment_error();
+            warn!("Failed to fetching consume_until");
+            continue;
+        };
 
         let cf = match DateTime::parse_from_str(
             &consume_from.to_string(),

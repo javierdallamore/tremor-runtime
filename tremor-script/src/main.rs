@@ -257,9 +257,9 @@ fn main() -> Result<()> {
                 &mut global_map,
             );
             match expr {
-                // Seperate out the speical case of emiting the inbound evet,
+                // Separate out the special case of emitting the inbound event,
                 // this way we don't have to clone it on the way out and can
-                // uswe the refference that was apssed in instead.
+                // use the reference that was passed in instead.
                 Ok(Return::EmitEvent { port }) => {
                     println!("Interpreter ran ok");
                     if matches.is_present("quiet") {
@@ -273,7 +273,7 @@ fn main() -> Result<()> {
                             "{} ",
                             serde_json::to_string_pretty(&Return::Emit { value: event, port })?
                         );
-                        let lexed_tokens = Vec::from_iter(lexer::Tokenizer::new(&result));
+                        let lexed_tokens = lexer::Tokenizer::new(&result).collect();
                         let mut h = TermHighlighter::new();
                         h.highlight(lexed_tokens)?;
                     }
@@ -286,7 +286,7 @@ fn main() -> Result<()> {
                         println!("{}", serde_json::to_string_pretty(&result)?);
                     } else {
                         let result = format!("{} ", serde_json::to_string_pretty(&result)?);
-                        let lexed_tokens = Vec::from_iter(lexer::Tokenizer::new(&result));
+                        let lexed_tokens = lexer::Tokenizer::new(&result).collect();
                         let mut h = TermHighlighter::new();
                         h.highlight(lexed_tokens)?;
                     }

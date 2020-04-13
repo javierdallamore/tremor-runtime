@@ -26,7 +26,7 @@ use serde::Serialize;
 use simd_json::borrowed::Value;
 use std::io::Write;
 
-/// Return of a secript execution
+/// Return of a script execution
 #[derive(Debug, Serialize, PartialEq)]
 pub enum Return<'event> {
     /// This script should emit the returned
@@ -51,8 +51,8 @@ impl<'run, 'event> From<Cont<'run, 'event>> for Return<'event>
 where
     'event: 'run,
 {
-    // This clones the data since we're returning it out of the scope of the
-    // esecution - we might want to investigate if we can get rid of this in some cases.
+    // TODO: This clones the data since we're returning it out of the scope of the
+    // execution - we might want to investigate if we can get rid of this in some cases.
     fn from(v: Cont<'run, 'event>) -> Self {
         match v {
             Cont::Cont(value) => Return::Emit {
@@ -119,14 +119,7 @@ where
 
         let script = rentals::Script::try_new(Box::new(source.clone()), |src| {
             let lexemes: Result<Vec<_>> = lexer::Tokenizer::new(src.as_str()).collect();
-            let mut filtered_tokens = Vec::new();
-
-            for t in lexemes? {
-                let keep = !t.value.is_ignorable();
-                if keep {
-                    filtered_tokens.push(Ok(t));
-                }
-            }
+            let filtered_tokens = lexemes?.into_iter().filter(|t| !t.value.is_ignorable());
 
             let fake_aggr_reg = AggrRegistry::default();
             let (script, ws) = grammar::ScriptParser::new()

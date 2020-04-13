@@ -169,7 +169,7 @@ impl Event {
 }
 
 /// Iterator over the event value and metadata
-/// if the evetn is a batch this will allow iterating
+/// if the event is a batch this will allow iterating
 /// over all the batched events
 pub struct ValueMetaIter<'value> {
     event: &'value Event,
@@ -966,7 +966,10 @@ impl Pipeline {
                 .collect(),
             stack: Vec::with_capacity(graph.len()),
             id: self.id.clone(),
-            metrics_idx: i2pos[&self.nodes["metrics"]],
+            metrics_idx: i2pos[&self
+                .nodes
+                .get("metrics")
+                .ok_or_else(|| Error::from("metrics node missing"))?],
             last_metrics: 0,
             state: State {
                 ops: iter::repeat(Value::null()).take(graph.len()).collect(),
@@ -1021,10 +1024,10 @@ mod test {
         assert_eq!(results[0].1.data.suffix().meta["class"], "default");
         dbg!(&e.metrics);
         // We ignore the first, and the last three nodes because:
-        // * The first one is the input, handled seperately
+        // * The first one is the input, handled separately
         assert_eq!(e.metrics[0].inputs.get("in"), None);
         assert_eq!(e.metrics[0].outputs.get("out"), Some(&1));
-        // * The last-2 is the output, handled seperately
+        // * The last-2 is the output, handled separately
         assert_eq!(e.metrics[e.metrics.len() - 3].inputs.get("in"), Some(&1));
         assert_eq!(e.metrics[e.metrics.len() - 3].outputs.get("out"), Some(&1));
         // * the last-1 is the error output

@@ -2,7 +2,7 @@ APP=tremor-runtime
 DOCKER_VSN=$(shell grep 'ARG tag' docker/tremor-runtime.dockerfile | sed 's/.*=//')
 CARGO_VSN=$(shell grep '^version' Cargo.toml | sed -e 's/.*=[^"]*"//' -e 's/"$$//')
 VSN=$(DOCKER_VSN)
-YEAR=2018-2019
+YEAR=2018-2020
 
 help:
 	@echo "This makefile wraps the tasks:"
@@ -23,29 +23,17 @@ it:
 	integration_testing/runner
 
 bench: force
-	cargo build --release --features bench
+	cargo build --release -p tremor-server
 	./bench/all.sh | tee bench-`date +%s`.txt
 
 force:
 	true
 
 chk_copyright:
-	@for f in `find . -name '*.rs' | grep -v '/target'`; do cat $$f | grep 'Copyright 2018-2020, Wayfair GmbH' > /dev/null || (echo "##[error] No copyright in $$f") done
+	@./.github/checks/copyright.sh
 
-chk_copyright_ci:
-	@for f in `find . -name '*.rs' | grep -v '/target'`; do cat $$f | grep 'Copyright 2018-2020, Wayfair GmbH' > /dev/null || exit 1; done
-
-chk_unwrap:
-	@./checks/safety.sh -u
-
-chk_unwrap_ci:
-	@./checks/safety.sh -u
-
-chk_panic:
-	@./checks/safety.sh -p
-
-chk_panic_ci:
-	@./checks/safety.sh -p
+chk:
+	@./.github/checks/safety.sh -a
 
 dep-list:
 	@cargo tree --all | sed -e 's/[^a-z]*\([a-z]\)/\1/' | sort -u

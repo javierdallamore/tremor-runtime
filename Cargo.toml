@@ -50,7 +50,7 @@ simd-json = {version = "0.3", features = ["known-key"]}
 threadpool = "1"
 tremor-pipeline = { path = "tremor-pipeline" }
 url = "2.1"
-async-tungstenite = { version = "0.4.0", features = ["async-std-runtime"] }
+async-tungstenite = { version = "0.4.2", features = ["async-std-runtime"] }
 
 
 log = "0.4"
@@ -97,13 +97,6 @@ hyper = "0.10"  # chan't update this because of google
 # logstash grok patterns
 grok = "1"
 
-snmalloc-rs = { version = "0.2", optional = true }
-
-# stats
-libc = "0.2.53"
-procfs = "0.5.3"
-proc-mounts = "0.2.2"
-
 [dependencies.tungstenite]
 version = "0.10"
 default-features = false
@@ -117,8 +110,7 @@ regex = "1"
 env_logger = "0.7"
 
 [features]
-default = [ "snmalloc" ]
-snmalloc = [ "snmalloc-rs" ]
+default = [ ]
 
 [patch.crates-io]
 #  waiting for https://github.com/http-rs/tide/pull/408
