@@ -39,11 +39,13 @@ use std::sync::{Arc, Mutex};
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
     /// source logwatcher to read data from, it will be iterated over repeatedly,
-    /// can be xz compressed
     pub source: String,
+    // valid lines to consume
     pub regex: String,
+    // max lines to accumulate to match regex
     pub max_lines: usize,
-    pub timeout: i64,
+    // seconds to wait for new lines until send whatever was accumulated
+    pub wait_for_new_line: i64,
     #[serde(default = "dflt::d_false")]
     pub close_on_done: bool,
 }
@@ -81,7 +83,7 @@ fn onramp_loop(
         .build()
         .unwrap();
     let mut log_watcher =
-        LogWatcherAgent::register(source, regex, config.max_lines, config.timeout).unwrap();
+        LogWatcherAgent::register(source, regex, config.max_lines, config.wait_for_new_line).unwrap();
 
     let origin_uri = tremor_pipeline::EventOriginUri {
         scheme: "tremor-logwatcher".to_string(),
@@ -169,9 +171,9 @@ pub struct LogWatcherAgent {
     reader: BufReader<File>,
     finish: bool,
     regex: Regex,
-    acc: Vec<String>,
+    file_lines: Vec<String>,
     max_lines: usize,
-    timeout: i64,
+    wait_for_new_line: i64,
     last_read: i64,
 }
 
@@ -180,7 +182,7 @@ impl LogWatcherAgent {
         filename: String,
         regex: Regex,
         max_lines: usize,
-        timeout: i64,
+        wait_for_new_line: i64,
     ) -> Result<LogWatcherAgent> {
         let f = File::open(filename.clone()).unwrap();
         let metadata = f.metadata().unwrap();
@@ -195,10 +197,10 @@ impl LogWatcherAgent {
             reader: reader,
             finish: false,
             regex: regex,
-            acc: Vec::new(),
+            file_lines: Vec::new(),
             max_lines: max_lines,
             last_read: Utc::now().timestamp(),
-            timeout: timeout,
+            wait_for_new_line: wait_for_new_line,
         })
     }
 
@@ -254,31 +256,31 @@ impl LogWatcherAgent {
                         self.reader.seek(SeekFrom::Start(self.pos)).unwrap();
                         self.last_read = Utc::now().timestamp();
 
-                        self.acc.push(line.clone());
+                        self.file_lines.push(line.clone());
                         line.clear();
 
-                        let mut end = 0;
-                        let tmp = self.acc.join("");
-                        for mat in self.regex.find_iter(&tmp) {
-                            end = mat.end();
-                            let sub = &tmp[mat.start()..end];
+                        let mut last_match_index = 0;
+                        let lines_joined = self.file_lines.join("");
+                        for mat in self.regex.find_iter(&lines_joined) {
+                            last_match_index = mat.end();
+                            let sub = &lines_joined[mat.start()..last_match_index];
                             callback(sub.to_string());
                         }
 
-                        if end > 0 {
+                        if last_match_index > 0 {
                             // if something matched, we keep only the lines after the last matched line
-                            self.acc.clear();
+                            self.file_lines.clear();
                         }
 
-                        // remove lines while acc > max_lines
-                        while self.acc.len() > self.max_lines {
-                            self.acc.remove(0);
+                        // remove lines while file_lines > max_lines
+                        while self.file_lines.len() > self.max_lines {
+                            self.file_lines.remove(0);
                         }
                     } else {
                         let secs_since_last_read = Utc::now().timestamp() - self.last_read;
-                        if secs_since_last_read > self.timeout && self.acc.len() > 0 {
-                            callback(self.acc.join(""));
-                            self.acc.clear();
+                        if secs_since_last_read > self.wait_for_new_line && self.file_lines.len() > 0 {
+                            callback(self.file_lines.join(""));
+                            self.file_lines.clear();
                         }
 
                         if self.finish {
