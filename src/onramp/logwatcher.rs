@@ -17,10 +17,13 @@ use crate::onramp::prelude::*;
 use serde_yaml::Value;
 use std::io::{BufRead, BufReader};
 //use std::process;
+use chrono::Utc;
 use std::thread;
 use std::time::Duration;
 
 //import LogWatcherAgent
+use regex::Regex;
+use regex::RegexBuilder;
 use std::fs::File;
 //use std::io;
 use std::io::prelude::*;
@@ -38,6 +41,9 @@ pub struct Config {
     /// source logwatcher to read data from, it will be iterated over repeatedly,
     /// can be xz compressed
     pub source: String,
+    pub regex: String,
+    pub max_lines: usize,
+    pub timeout: i64,
     #[serde(default = "dflt::d_false")]
     pub close_on_done: bool,
 }
@@ -69,7 +75,13 @@ fn onramp_loop(
     let mut pipelines: Vec<(TremorURL, pipeline::Addr)> = Vec::new();
     let mut id = 0;
     let source = config.source.clone();
-    let mut log_watcher = LogWatcherAgent::register(source).unwrap();
+    let regex = RegexBuilder::new(&config.regex)
+        .dot_matches_new_line(true)
+        .multi_line(true)
+        .build()
+        .unwrap();
+    let mut log_watcher =
+        LogWatcherAgent::register(source, regex, config.max_lines, config.timeout).unwrap();
 
     let origin_uri = tremor_pipeline::EventOriginUri {
         scheme: "tremor-logwatcher".to_string(),
@@ -84,7 +96,6 @@ fn onramp_loop(
         let clone = Arc::clone(&lines);
         move || {
             log_watcher.watch(&mut |line: String| {
-                info!("Line read {}", &line);
                 let mut l = clone.lock().unwrap();
                 l.push(line);
             });
@@ -157,10 +168,20 @@ pub struct LogWatcherAgent {
     pos: u64,
     reader: BufReader<File>,
     finish: bool,
+    regex: Regex,
+    acc: Vec<String>,
+    max_lines: usize,
+    timeout: i64,
+    last_read: i64,
 }
 
 impl LogWatcherAgent {
-    pub fn register(filename: String) -> Result<LogWatcherAgent> {
+    pub fn register(
+        filename: String,
+        regex: Regex,
+        max_lines: usize,
+        timeout: i64,
+    ) -> Result<LogWatcherAgent> {
         let f = File::open(filename.clone()).unwrap();
         let metadata = f.metadata().unwrap();
 
@@ -173,6 +194,11 @@ impl LogWatcherAgent {
             pos: pos,
             reader: reader,
             finish: false,
+            regex: regex,
+            acc: Vec::new(),
+            max_lines: max_lines,
+            last_read: Utc::now().timestamp(),
+            timeout: timeout,
         })
     }
 
@@ -195,7 +221,7 @@ impl LogWatcherAgent {
                         self.finish = true;
                         self.watch(callback);
                         self.finish = false;
-                        println!("reloading log file");
+                        info!("reloading log file");
                         self.reader = BufReader::new(f);
                         self.pos = 0;
                         self.inode = metadata.ino();
@@ -226,9 +252,35 @@ impl LogWatcherAgent {
                     if len > 0 {
                         self.pos += len as u64;
                         self.reader.seek(SeekFrom::Start(self.pos)).unwrap();
-                        callback(line.replace("\n", ""));
+                        self.last_read = Utc::now().timestamp();
+
+                        self.acc.push(line.clone());
                         line.clear();
+
+                        let mut end = 0;
+                        let tmp = self.acc.join("");
+                        for mat in self.regex.find_iter(&tmp) {
+                            end = mat.end();
+                            let sub = &tmp[mat.start()..end];
+                            callback(sub.to_string());
+                        }
+
+                        if end > 0 {
+                            // if something matched, we keep only the lines after the last matched line
+                            self.acc.clear();
+                        }
+
+                        // remove lines while acc > max_lines
+                        while self.acc.len() > self.max_lines {
+                            self.acc.remove(0);
+                        }
                     } else {
+                        let secs_since_last_read = Utc::now().timestamp() - self.last_read;
+                        if secs_since_last_read > self.timeout && self.acc.len() > 0 {
+                            callback(self.acc.join(""));
+                            self.acc.clear();
+                        }
+
                         if self.finish {
                             break;
                         } else {
@@ -238,7 +290,7 @@ impl LogWatcherAgent {
                     }
                 }
                 Err(err) => {
-                    println!("{}", err);
+                    error!("{}", err);
                 }
             }
         }
