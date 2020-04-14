@@ -1344,9 +1344,9 @@ checksum = "9b919933a397b79c37e33b77bb2aa3dc8eb6e165ad809e58ff75bc7db2e34574"
 
 [[package]]
 name = "google-pubsub1"
-version = "1.0.12+20190625"
+version = "1.0.13+20200403"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7295fe729c3d8d7ec13974c1d07b6c0640f67ca647d3c03ed41faca44a22ffc"
+checksum = "abab7e0fded0d4e28b5bfbdbacfea007efba04eee59fe930036c605f687306d0"
 dependencies = [
  "hyper 0.10.16",
  "mime 0.2.6",
@@ -1359,9 +1359,9 @@ dependencies = [
 
 [[package]]
 name = "google-storage1"
-version = "1.0.12+20190624"
+version = "1.0.13+20200326"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "066c44ec4fdf5d4a4aaf7a09aec3dc2e23bb203e762b15a052941f9fffc06edb"
+checksum = "b6ff8a63135e77611bb687b4167d8f3f49d865afe6df065f49be52b89b4e8a17"
 dependencies = [
  "hyper 0.10.16",
  "mime 0.2.6",
@@ -3547,18 +3547,18 @@ checksum = "f7fb9b0bb877b35a1cc1474a3b43d9c226a2625311760cdda2cbccbc0c7a8376"
 
 [[package]]
 name = "snmalloc-rs"
-version = "0.2.9"
+version = "0.2.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73ec748a46508c2c6f72110911f3a064fbbd0aa3a46b589364565a89a77251d3"
+checksum = "7f80f4218e4dbf59e47c813f752bad1885d96d1927825b69ec5fe48734f5bce5"
 dependencies = [
  "snmalloc-sys",
 ]
 
 [[package]]
 name = "snmalloc-sys"
-version = "0.2.8"
+version = "0.2.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c8613c1a9e94876fdfc91d69211c7513d2f34e75c8bfd7b1510e7aea6ff43f8"
+checksum = "ad017500db7b027deb5423d82c1ab293f59f59914ca32ec978be396a1358d02f"
 dependencies = [
  "cmake",
  "libc",
