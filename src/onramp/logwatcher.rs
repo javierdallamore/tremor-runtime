@@ -33,8 +33,7 @@ use std::io::SeekFrom;
 use std::os::unix::fs::MetadataExt;
 //use std::thread::sleep;
 //use std::time::Duration;
-
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::sync_channel;
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
@@ -76,30 +75,34 @@ fn onramp_loop(
 ) -> Result<()> {
     let mut pipelines: Vec<(TremorURL, pipeline::Addr)> = Vec::new();
     let mut id = 0;
+    let hostname = hostname();
     let source = config.source.clone();
-    let regex = RegexBuilder::new(&config.regex)
+    let line_regex = config.regex.clone();
+    let max_lines = config.max_lines;
+    let (loop_tx, loop_rx) = sync_channel::<String>(max_lines);
+    let wait_for_new_line = config.wait_for_new_line;
+
+    let origin_uri = tremor_pipeline::EventOriginUri {
+        scheme: "tremor-logwatcher".to_string(),
+        host: hostname.clone(),
+        port: None,
+        path: vec![source.clone()],
+    };
+
+    info!("Starting LogWatcher");
+    let regex = RegexBuilder::new(&line_regex)
         .dot_matches_new_line(true)
         .multi_line(true)
         .build()
         .unwrap();
+
     let mut log_watcher =
-        LogWatcherAgent::register(source, regex, config.max_lines, config.wait_for_new_line).unwrap();
+        LogWatcherAgent::register(source.clone(), regex, max_lines, wait_for_new_line).unwrap();
 
-    let origin_uri = tremor_pipeline::EventOriginUri {
-        scheme: "tremor-logwatcher".to_string(),
-        host: hostname(),
-        port: None,
-        path: vec![config.source.clone()],
-    };
-
-    info!("Starting LogWatcher");
-    let lines = Arc::new(Mutex::new(vec![]));
     std::thread::spawn({
-        let clone = Arc::clone(&lines);
         move || {
             log_watcher.watch(&mut |line: String| {
-                let mut l = clone.lock().unwrap();
-                l.push(line);
+                loop_tx.send(line).unwrap();
             });
         }
     });
@@ -111,30 +114,27 @@ fn onramp_loop(
             PipeHandlerResult::Normal => (),
         }
 
-        let clone = Arc::clone(&lines);
-        let mut linesb = clone.lock().unwrap();
-        while let Some(line) = linesb.pop() {
-            let mut ingest_ns = nanotime();
-            let ts = (ingest_ns / 1000000) as i64;
+        let line = loop_rx.recv().unwrap();
+        let mut ingest_ns = nanotime();
+        let ts = (ingest_ns / 1000000) as i64;
 
-            let data = serde_json::to_vec(&json!({
-                "headers": {"hostname": hostname(), "file": config.source, "ts": ts},
-                "body": line,
-            }));
+        let data = serde_json::to_vec(&json!({
+            "headers": {"hostname": hostname.clone(), "file": source, "ts": ts},
+            "body": line,
+        }));
 
-            if let Ok(data) = data {
-                send_event(
-                    &pipelines,
-                    &mut preprocessors,
-                    &mut codec,
-                    &mut metrics_reporter,
-                    &mut ingest_ns,
-                    &origin_uri,
-                    id,
-                    data,
-                );
-                id += 1;
-            }
+        if let Ok(data) = data {
+            send_event(
+                &pipelines,
+                &mut preprocessors,
+                &mut codec,
+                &mut metrics_reporter,
+                &mut ingest_ns,
+                &origin_uri,
+                id,
+                data,
+            );
+            id += 1;
         }
     }
 }
@@ -278,7 +278,9 @@ impl LogWatcherAgent {
                         }
                     } else {
                         let secs_since_last_read = Utc::now().timestamp() - self.last_read;
-                        if secs_since_last_read > self.wait_for_new_line && self.file_lines.len() > 0 {
+                        if secs_since_last_read > self.wait_for_new_line
+                            && self.file_lines.len() > 0
+                        {
                             callback(self.file_lines.join(""));
                             self.file_lines.clear();
                         }
