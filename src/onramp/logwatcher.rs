@@ -94,15 +94,15 @@ fn onramp_loop(
         .dot_matches_new_line(true)
         .multi_line(true)
         .build()
-        .unwrap();
+        .expect("wrong regex");
 
     let mut log_watcher =
-        LogWatcherAgent::register(source.clone(), regex, max_lines, wait_for_new_line).unwrap();
+        LogWatcherAgent::register(source.clone(), regex, max_lines, wait_for_new_line).expect("LogWatcherAgent::register failed");
 
     std::thread::spawn({
         move || {
             log_watcher.watch(&mut |line: String| {
-                loop_tx.send(line).unwrap();
+                loop_tx.send(line).expect("error sending to channel");
             });
         }
     });
@@ -114,9 +114,9 @@ fn onramp_loop(
             PipeHandlerResult::Normal => (),
         }
 
-        let line = loop_rx.recv().unwrap();
+        let line = loop_rx.recv().expect("error receiving from channel");
         let mut ingest_ns = nanotime();
-        let ts = (ingest_ns / 1_000_000) as i64;
+        let ts = (ingest_ns / 1_000_000) as u64;
 
         let data = serde_json::to_vec(&json!({
             "headers": {"hostname": hostname.clone(), "file": source, "ts": ts},
@@ -164,6 +164,7 @@ impl Onramp for LogWatcher {
     }
 }
 
+#[derive(Debug)]
 pub struct LogWatcherAgent {
     filename: String,
     inode: u64,
@@ -184,13 +185,16 @@ impl LogWatcherAgent {
         max_lines: usize,
         wait_for_new_line: i64,
     ) -> Result<LogWatcherAgent> {
-        let f = File::open(filename.clone()).unwrap();
-        let metadata = f.metadata().unwrap();
+        let f = File::open(filename.clone()).expect("error opening file");
+        let metadata = f.metadata().expect("error getting file metadata");
 
         let mut reader = BufReader::new(f);
         let pos = metadata.len();
-        reader.seek(SeekFrom::Start(pos)).unwrap();
-        Ok(LogWatcherAgent {
+        reader
+            .seek(SeekFrom::Start(pos))
+            .expect("seek in file failed");
+
+        let logwatcher_agent = LogWatcherAgent {
             filename,
             inode: metadata.ino(),
             pos,
@@ -201,7 +205,9 @@ impl LogWatcherAgent {
             max_lines,
             last_read: Utc::now().timestamp(),
             wait_for_new_line,
-        })
+        };
+        warn!("{:?}", logwatcher_agent);
+        Ok(logwatcher_agent)
     }
 
     fn reopen_if_log_rotated<F: ?Sized>(&mut self, callback: &mut F)
@@ -212,25 +218,23 @@ impl LogWatcherAgent {
             match File::open(self.filename.clone()) {
                 Ok(x) => {
                     let f = x;
-                    let metadata = match f.metadata() {
-                        Ok(m) => m,
-                        Err(_) => {
+                    if let Ok(metadata) = f.metadata() {
+                        if metadata.ino() == self.inode {
                             thread::sleep(Duration::new(1, 0));
-                            continue;
+                        } else {
+                            self.finish = true;
+                            self.watch(callback);
+                            self.finish = false;
+                            info!("reloading log file");
+                            self.reader = BufReader::new(f);
+                            self.pos = 0;
+                            self.inode = metadata.ino();
                         }
-                    };
-                    if metadata.ino() == self.inode {
-                        thread::sleep(Duration::new(1, 0));
+                        break;
                     } else {
-                        self.finish = true;
-                        self.watch(callback);
-                        self.finish = false;
-                        info!("reloading log file");
-                        self.reader = BufReader::new(f);
-                        self.pos = 0;
-                        self.inode = metadata.ino();
+                        thread::sleep(Duration::new(1, 0));
+                        continue;
                     }
-                    break;
                 }
                 Err(err) => {
                     if err.kind() == ErrorKind::NotFound {
@@ -253,35 +257,32 @@ impl LogWatcherAgent {
                 Ok(len) => {
                     if len > 0 {
                         self.pos += len as u64;
-                        match self.reader.seek(SeekFrom::Start(self.pos)) {
-                            Ok(_) => {
-                                self.last_read = Utc::now().timestamp();
+                        self.reader
+                            .seek(SeekFrom::Start(self.pos))
+                            .expect("seek in file failed");
+                        self.last_read = Utc::now().timestamp();
 
-                                self.file_lines.push(line.clone());
-                                line.clear();
+                        self.file_lines.push(line.clone());
+                        line.clear();
 
-                                let mut last_match_index = 0;
-                                let lines_joined = self.file_lines.join("");
-                                for mat in self.regex.find_iter(&lines_joined) {
-                                    last_match_index = mat.end();
-                                    let sub = &lines_joined[mat.start()..last_match_index];
-                                    callback(sub.to_string());
-                                }
-
-                                if last_match_index > 0 {
-                                    // if something matched, we keep only the lines after the last matched line
-                                    self.file_lines.clear();
-                                }
-
-                                // remove lines while file_lines > max_lines
-                                while self.file_lines.len() > self.max_lines {
-                                    self.file_lines.remove(0);
-                                }
-                            }
-                            Err(err) => {
-                                error!("{}", err);
-                            }
+                        let mut last_match_index = 0;
+                        let lines_joined = self.file_lines.join("");
+                        for mat in self.regex.find_iter(&lines_joined) {
+                            last_match_index = mat.end();
+                            let sub = &lines_joined[mat.start()..last_match_index];
+                            callback(sub.to_string());
                         }
+
+                        if last_match_index > 0 {
+                            // if something matched, we keep only the lines after the last matched line
+                            self.file_lines.clear();
+                        }
+
+                        // remove lines while file_lines > max_lines
+                        while self.file_lines.len() > self.max_lines {
+                            self.file_lines.remove(0);
+                        }
+                        warn!("{:?}", self.file_lines);
                     } else {
                         let secs_since_last_read = Utc::now().timestamp() - self.last_read;
                         if secs_since_last_read > self.wait_for_new_line
@@ -295,7 +296,9 @@ impl LogWatcherAgent {
                             break;
                         } else {
                             self.reopen_if_log_rotated(callback);
-                            self.reader.seek(SeekFrom::Start(self.pos)).unwrap();
+                            self.reader
+                                .seek(SeekFrom::Start(self.pos))
+                                .expect("seek in file failed");
                         }
                     }
                 }

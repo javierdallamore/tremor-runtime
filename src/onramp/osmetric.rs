@@ -95,7 +95,7 @@ fn onramp_loop(
 
         thread::sleep(Duration::from_millis(config.interval));
         let mut ingest_ns = nanotime();
-        let ts = (ingest_ns / 1_000_000) as i64;
+        let ts = (ingest_ns / 1_000_000) as u64;
 
         let metrics: Vec<Metric> = match config.metric {
             MetricType::Sys => SysInfo::get_metrics(),
@@ -161,15 +161,15 @@ pub struct MountInfo {
     used: u64,
     available: u64,
     total: u64,
-    use_pc: u32,
+    use_pc: u64,
 }
 
 impl MountInfo {
     pub fn new(
-        source: PathBuf,
-        dest: PathBuf,
+        source: &PathBuf,
+        dest: &PathBuf,
         fstype: &str,
-        options: &Vec<String>,
+        options: &[String],
         dump: i32,
         pass: i32,
     ) -> MountInfo {
@@ -204,7 +204,7 @@ impl MountInfo {
                             pass,
                         }) => {
                             let mount_info =
-                                MountInfo::new(source, dest, &fstype, &options, dump, pass);
+                                MountInfo::new(&source, &dest, &fstype, &options, dump, pass);
                             metrics.push(Metric::Mount(mount_info));
                         }
                         Err(err) => {
@@ -223,7 +223,7 @@ impl MountInfo {
 
 pub fn statvfs(mount_point: &str) -> Option<libc::statvfs> {
     unsafe {
-        let mountp = CString::new(mount_point).unwrap();
+        let mountp = CString::new(mount_point).expect("CString::new failed");
         let mut stats: libc::statvfs = std::mem::zeroed();
         if libc::statvfs(mountp.as_ptr(), &mut stats) == 0 {
             Some(stats)
@@ -233,7 +233,7 @@ pub fn statvfs(mount_point: &str) -> Option<libc::statvfs> {
     }
 }
 
-pub fn fs_usage(mount_point: &str) -> (u64, u64, u64, u32) {
+pub fn fs_usage(mount_point: &str) -> (u64, u64, u64, u64) {
     match statvfs(mount_point) {
         Some(stats) => {
             let total = stats.f_blocks * stats.f_frsize / 1024;
@@ -248,7 +248,7 @@ pub fn fs_usage(mount_point: &str) -> (u64, u64, u64, u32) {
                 u100 / nonroot_total
             };
 
-            (used, available, total, pct as u32)
+            (used, available, total, pct as u64)
         }
         None => (0, 0, 0, 100),
     }
@@ -276,7 +276,7 @@ impl ProcInfo {
 
         let cmdline = match proc.cmdline() {
             Ok(items) => {
-                if items.len() == 0 {
+                if items.is_empty() {
                     String::from("?")
                 } else {
                     items.join(" ")
