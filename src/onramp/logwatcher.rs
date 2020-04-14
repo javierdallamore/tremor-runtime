@@ -22,8 +22,7 @@ use std::thread;
 use std::time::Duration;
 
 //import LogWatcherAgent
-use regex::Regex;
-use regex::RegexBuilder;
+use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use std::fs::File;
 //use std::io;
 use std::io::prelude::*;
@@ -40,7 +39,7 @@ pub struct Config {
     /// source logwatcher to read data from, it will be iterated over repeatedly,
     pub source: String,
     // valid lines to consume
-    pub regex: String,
+    pub regex: Vec<String>,
     // max lines to accumulate to match regex
     pub max_lines: usize,
     // seconds to wait for new lines until send whatever was accumulated
@@ -77,10 +76,8 @@ fn onramp_loop(
     let mut id = 0;
     let hostname = hostname();
     let source = config.source.clone();
-    let line_regex = config.regex.clone();
     let max_lines = config.max_lines;
     let (loop_tx, loop_rx) = sync_channel::<String>(max_lines);
-    let wait_for_new_line = config.wait_for_new_line;
 
     let origin_uri = tremor_pipeline::EventOriginUri {
         scheme: "tremor-logwatcher".to_string(),
@@ -90,14 +87,14 @@ fn onramp_loop(
     };
 
     info!("Starting LogWatcher");
-    let regex = RegexBuilder::new(&line_regex)
-        .dot_matches_new_line(true)
-        .multi_line(true)
-        .build()
-        .expect("wrong regex");
 
-    let mut log_watcher =
-        LogWatcherAgent::register(source.clone(), regex, max_lines, wait_for_new_line).expect("LogWatcherAgent::register failed");
+    let mut log_watcher = LogWatcherAgent::register(
+        source.clone(),
+        config.regex.clone(),
+        config.max_lines,
+        config.wait_for_new_line,
+    )
+    .expect("LogWatcherAgent::register failed");
 
     std::thread::spawn({
         move || {
@@ -171,7 +168,8 @@ pub struct LogWatcherAgent {
     pos: u64,
     reader: BufReader<File>,
     finish: bool,
-    regex: Regex,
+    regex_list: Vec<Regex>,
+    regex_set: RegexSet,
     file_lines: Vec<String>,
     max_lines: usize,
     wait_for_new_line: i64,
@@ -181,7 +179,7 @@ pub struct LogWatcherAgent {
 impl LogWatcherAgent {
     pub fn register(
         filename: String,
-        regex: Regex,
+        regex_str: Vec<String>,
         max_lines: usize,
         wait_for_new_line: i64,
     ) -> Result<LogWatcherAgent> {
@@ -194,19 +192,36 @@ impl LogWatcherAgent {
             .seek(SeekFrom::Start(pos))
             .expect("seek in file failed");
 
+        let regex_set = RegexSetBuilder::new(&regex_str)
+            .dot_matches_new_line(true)
+            .multi_line(true)
+            .build()
+            .expect("wrong regex");
+
+        let regex_list: Vec<Regex> = regex_str
+            .into_iter()
+            .map(|x| {
+                RegexBuilder::new(&x)
+                    .dot_matches_new_line(true)
+                    .multi_line(true)
+                    .build()
+                    .expect("wrong regex")
+            })
+            .collect();
+
         let logwatcher_agent = LogWatcherAgent {
             filename,
             inode: metadata.ino(),
             pos,
             reader,
             finish: false,
-            regex,
+            regex_list,
+            regex_set,
             file_lines: Vec::new(),
             max_lines,
             last_read: Utc::now().timestamp(),
             wait_for_new_line,
         };
-        warn!("{:?}", logwatcher_agent);
         Ok(logwatcher_agent)
     }
 
@@ -267,10 +282,19 @@ impl LogWatcherAgent {
 
                         let mut last_match_index = 0;
                         let lines_joined = self.file_lines.join("");
-                        for mat in self.regex.find_iter(&lines_joined) {
-                            last_match_index = mat.end();
-                            let sub = &lines_joined[mat.start()..last_match_index];
-                            callback(sub.to_string());
+                        let matches: Vec<_> =
+                            self.regex_set.matches(&lines_joined).into_iter().collect();
+
+                        if let Some(regex_matched_index) = matches.first() {
+                            if let Some(first_regex_matched) =
+                                self.regex_list.get(*regex_matched_index)
+                            {
+                                for mat in first_regex_matched.find_iter(&lines_joined) {
+                                    last_match_index = mat.end();
+                                    let sub = &lines_joined[mat.start()..last_match_index];
+                                    callback(sub.to_string());
+                                }
+                            }
                         }
 
                         if last_match_index > 0 {
@@ -282,7 +306,6 @@ impl LogWatcherAgent {
                         while self.file_lines.len() > self.max_lines {
                             self.file_lines.remove(0);
                         }
-                        warn!("{:?}", self.file_lines);
                     } else {
                         let secs_since_last_read = Utc::now().timestamp() - self.last_read;
                         if secs_since_last_read > self.wait_for_new_line
