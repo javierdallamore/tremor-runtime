@@ -116,7 +116,7 @@ fn onramp_loop(
 
         let line = loop_rx.recv().unwrap();
         let mut ingest_ns = nanotime();
-        let ts = (ingest_ns / 1000000) as i64;
+        let ts = (ingest_ns / 1_000_000) as i64;
 
         let data = serde_json::to_vec(&json!({
             "headers": {"hostname": hostname.clone(), "file": source, "ts": ts},
@@ -191,16 +191,16 @@ impl LogWatcherAgent {
         let pos = metadata.len();
         reader.seek(SeekFrom::Start(pos)).unwrap();
         Ok(LogWatcherAgent {
-            filename: filename,
+            filename,
             inode: metadata.ino(),
-            pos: pos,
-            reader: reader,
+            pos,
+            reader,
             finish: false,
-            regex: regex,
+            regex,
             file_lines: Vec::new(),
-            max_lines: max_lines,
+            max_lines,
             last_read: Utc::now().timestamp(),
-            wait_for_new_line: wait_for_new_line,
+            wait_for_new_line,
         })
     }
 
@@ -219,7 +219,9 @@ impl LogWatcherAgent {
                             continue;
                         }
                     };
-                    if metadata.ino() != self.inode {
+                    if metadata.ino() == self.inode {
+                        thread::sleep(Duration::new(1, 0));
+                    } else {
                         self.finish = true;
                         self.watch(callback);
                         self.finish = false;
@@ -227,8 +229,6 @@ impl LogWatcherAgent {
                         self.reader = BufReader::new(f);
                         self.pos = 0;
                         self.inode = metadata.ino();
-                    } else {
-                        thread::sleep(Duration::new(1, 0));
                     }
                     break;
                 }
@@ -253,33 +253,39 @@ impl LogWatcherAgent {
                 Ok(len) => {
                     if len > 0 {
                         self.pos += len as u64;
-                        self.reader.seek(SeekFrom::Start(self.pos)).unwrap();
-                        self.last_read = Utc::now().timestamp();
+                        match self.reader.seek(SeekFrom::Start(self.pos)) {
+                            Ok(_) => {
+                                self.last_read = Utc::now().timestamp();
 
-                        self.file_lines.push(line.clone());
-                        line.clear();
+                                self.file_lines.push(line.clone());
+                                line.clear();
 
-                        let mut last_match_index = 0;
-                        let lines_joined = self.file_lines.join("");
-                        for mat in self.regex.find_iter(&lines_joined) {
-                            last_match_index = mat.end();
-                            let sub = &lines_joined[mat.start()..last_match_index];
-                            callback(sub.to_string());
-                        }
+                                let mut last_match_index = 0;
+                                let lines_joined = self.file_lines.join("");
+                                for mat in self.regex.find_iter(&lines_joined) {
+                                    last_match_index = mat.end();
+                                    let sub = &lines_joined[mat.start()..last_match_index];
+                                    callback(sub.to_string());
+                                }
 
-                        if last_match_index > 0 {
-                            // if something matched, we keep only the lines after the last matched line
-                            self.file_lines.clear();
-                        }
+                                if last_match_index > 0 {
+                                    // if something matched, we keep only the lines after the last matched line
+                                    self.file_lines.clear();
+                                }
 
-                        // remove lines while file_lines > max_lines
-                        while self.file_lines.len() > self.max_lines {
-                            self.file_lines.remove(0);
+                                // remove lines while file_lines > max_lines
+                                while self.file_lines.len() > self.max_lines {
+                                    self.file_lines.remove(0);
+                                }
+                            }
+                            Err(err) => {
+                                error!("{}", err);
+                            }
                         }
                     } else {
                         let secs_since_last_read = Utc::now().timestamp() - self.last_read;
                         if secs_since_last_read > self.wait_for_new_line
-                            && self.file_lines.len() > 0
+                            && !self.file_lines.is_empty()
                         {
                             callback(self.file_lines.join(""));
                             self.file_lines.clear();

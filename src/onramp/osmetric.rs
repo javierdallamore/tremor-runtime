@@ -25,11 +25,10 @@ use serde::{Deserialize, Serialize};
 // MountInfo imports
 // SysInfo Imports
 // ProcInfo imports
-use std::ffi::CString;
-use std::path::PathBuf;
 use libc;
 use proc_mounts::{self, MountIter};
-
+use std::ffi::CString;
+use std::path::PathBuf;
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
@@ -96,7 +95,7 @@ fn onramp_loop(
 
         thread::sleep(Duration::from_millis(config.interval));
         let mut ingest_ns = nanotime();
-        let ts = (ingest_ns / 1000000) as i64;
+        let ts = (ingest_ns / 1_000_000) as i64;
 
         let metrics: Vec<Metric> = match config.metric {
             MetricType::Sys => SysInfo::get_metrics(),
@@ -204,9 +203,8 @@ impl MountInfo {
                             dump,
                             pass,
                         }) => {
-                            let mount_info = MountInfo::new(
-                                source, dest, &fstype, &options, dump, pass,
-                            );
+                            let mount_info =
+                                MountInfo::new(source, dest, &fstype, &options, dump, pass);
                             metrics.push(Metric::Mount(mount_info));
                         }
                         Err(err) => {
@@ -227,10 +225,10 @@ pub fn statvfs(mount_point: &str) -> Option<libc::statvfs> {
     unsafe {
         let mountp = CString::new(mount_point).unwrap();
         let mut stats: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(mountp.as_ptr(), &mut stats) != 0 {
-            None
-        } else {
+        if libc::statvfs(mountp.as_ptr(), &mut stats) == 0 {
             Some(stats)
+        } else {
+            None
         }
     }
 }
@@ -254,8 +252,6 @@ pub fn fs_usage(mount_point: &str) -> (u64, u64, u64, u32) {
         }
         None => (0, 0, 0, 100),
     }
-
-
 }
 
 // ProcInfo
@@ -297,11 +293,11 @@ impl ProcInfo {
             starttime: proc.stat.starttime,
             utime: proc.stat.utime,
             stime: proc.stat.stime,
-            cmdline: cmdline,
+            cmdline,
         }
     }
 
-    pub fn get_metrics() ->  Vec<Metric> {
+    pub fn get_metrics() -> Vec<Metric> {
         let mut metrics = Vec::new();
         for process in procfs::all_processes() {
             let proc_info = ProcInfo::new(&process);
@@ -338,7 +334,7 @@ impl SysInfo {
             }
         };
 
-        let (load_avg_1, load_avg_5, load_avg_15) = match procfs::LoadAverage::new() {
+        let (load_avg_one, load_avg_five, load_avg_fifteen) = match procfs::LoadAverage::new() {
             Ok(la) => (Some(la.one), Some(la.five), Some(la.fifteen)),
             Err(err) => {
                 eprintln!("Error loading load avg: {}", err);
@@ -351,9 +347,9 @@ impl SysInfo {
             mem_free,
             mem_buffers,
             mem_cached,
-            load_avg_1,
-            load_avg_5,
-            load_avg_15,
+            load_avg_1: load_avg_one,
+            load_avg_5: load_avg_five,
+            load_avg_15: load_avg_fifteen,
         }
     }
 
