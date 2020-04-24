@@ -73,15 +73,25 @@ impl Rest {
         };
         c = c.body_bytes(&payload);
         for (k, v) in config.headers {
-            use http::header::HeaderName;
-            match HeaderName::from_bytes(k.as_str().as_bytes()) {
+            use http_types::headers::HeaderName;
+            match HeaderName::from_ascii(k.as_str().as_bytes().to_vec()) {
                 Ok(h) => {
-                    c = c.set_header(&h, v.as_str());
+                    c = c.set_header(h, v.as_str());
                 }
                 Err(e) => error!("Bad header name: {}", e),
             }
         }
-        c.await?;
+
+        let mut reply = c.await?;
+        let status = reply.status();
+        if status.is_client_error() || status.is_server_error() {
+            if let Ok(body) = reply.body_string().await {
+                error!("HTTP request failed: {} => {}", status, body)
+            } else {
+                error!("HTTP request failed: {}", status)
+            }
+        }
+
         let d = duration_to_millis(start.elapsed());
         Ok(d)
     }
