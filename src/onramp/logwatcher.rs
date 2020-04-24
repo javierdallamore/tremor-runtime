@@ -12,43 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::dflt;
 use crate::onramp::prelude::*;
 use serde_yaml::Value;
-use std::io::{BufRead, BufReader};
 //use std::process;
-use chrono::Utc;
 use std::thread;
+
+mod config;
+mod handlers;
+mod input;
+mod path;
+mod process;
+mod restore;
+extern crate serde_humanize_rs;
+
+use config::{Config, SourceSpec};
+use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
+use input::Content;
+use process::ProcessInfo;
+use restore::RestoreState;
+use std::fs::OpenOptions;
+use std::io::{LineWriter, Write};
+use std::thread::JoinHandle;
 use std::time::Duration;
-
-//import LogWatcherAgent
-use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
-use std::fs::File;
-//use std::io;
-use std::io::prelude::*;
-//use std::io::BufReader;
-use std::io::ErrorKind;
-use std::io::SeekFrom;
-use std::os::unix::fs::MetadataExt;
-//use std::thread::sleep;
-//use std::time::Duration;
-use std::sync::mpsc::sync_channel;
-
-#[derive(Deserialize, Debug, Clone)]
-pub struct Config {
-    /// source logwatcher to read data from, it will be iterated over repeatedly,
-    pub source: String,
-    // valid lines to consume
-    pub regex: Vec<String>,
-    // max lines to accumulate to match regex
-    pub max_lines: usize,
-    // seconds to wait for new lines until send whatever was accumulated
-    pub wait_for_new_line: i64,
-    #[serde(default = "dflt::d_false")]
-    pub close_on_done: bool,
-}
-
-impl ConfigImpl for Config {}
 
 pub struct LogWatcher {
     pub config: Config,
@@ -74,66 +59,85 @@ fn onramp_loop(
 ) -> Result<()> {
     let mut pipelines: Vec<(TremorURL, pipeline::Addr)> = Vec::new();
     let mut id = 0;
-    let hostname = hostname();
-    let source = config.source.clone();
-    let max_lines = config.max_lines;
-    let (loop_tx, loop_rx) = sync_channel::<String>(max_lines);
+    let (content_sender, content_receiver) = bounded(0);
 
     let origin_uri = tremor_pipeline::EventOriginUri {
         scheme: "tremor-logwatcher".to_string(),
-        host: hostname.clone(),
+        host: hostname(),
         port: None,
-        path: vec![source.clone()],
+        path: vec![config.source.path.clone()],
     };
 
-    info!("Starting LogWatcher");
+    info!("starting logwatcher");
 
-    let mut log_watcher = LogWatcherAgent::register(
-        source.clone(),
-        config.regex.clone(),
-        config.max_lines,
-        config.wait_for_new_line,
-    )
-    .expect("LogWatcherAgent::register failed");
+    info!("get file consumed state from file");
+    let restore_state = match &config.restore_file {
+        Some(path) => match RestoreState::from_file(&path) {
+            Ok(rs) => rs,
+            Err(err) => {
+                error!("restoring state from {}: {:?}", path, err);
+                RestoreState::empty()
+            }
+        },
+        None => RestoreState::empty(),
+    };
 
-    std::thread::spawn({
-        move || {
-            log_watcher.watch(&mut |line: String| {
-                loop_tx.send(line).expect("error sending to channel");
-            });
+    if let Ok(source_spec) = config.source.to_source_spec() {
+        let (walker_sender, source_sender, join_handles) =
+            start_all(content_sender, source_spec, restore_state);
+
+        loop {
+            match task::block_on(handle_pipelines(&rx, &mut pipelines, &mut metrics_reporter))? {
+                PipeHandlerResult::Retry => continue,
+                PipeHandlerResult::Terminate => return Ok(()),
+                PipeHandlerResult::Normal => (),
+            }
+
+            match content_receiver.recv_timeout(Duration::from_millis(1000)) {
+                Ok(content) => {
+                    let data = serde_json::to_vec(&json!(content));
+
+                    let mut ingest_ns = nanotime();
+                    if let Ok(data) = data {
+                        send_event(
+                            &pipelines,
+                            &mut preprocessors,
+                            &mut codec,
+                            &mut metrics_reporter,
+                            &mut ingest_ns,
+                            &origin_uri,
+                            id,
+                            data,
+                        );
+                        id += 1;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => trace!("recv timeout"),
+                Err(error) => {
+                    error!("{}", error);
+                    // TODO until I discover how to subscribe to process kill and call the methods bellow
+                    break;
+                }
+            }
         }
-    });
 
-    loop {
-        match task::block_on(handle_pipelines(&rx, &mut pipelines, &mut metrics_reporter))? {
-            PipeHandlerResult::Retry => continue,
-            PipeHandlerResult::Terminate => return Ok(()),
-            PipeHandlerResult::Normal => (),
+        // TODO I do not know how where stop all and store file state before closing
+        info!("stopping everything and saving state");
+
+        match walker_sender.send(path::WalkerMsg::Stop) {
+            Ok(_) => info!("ok sending stop signal to walker"),
+            Err(err) => error!("Error sending stop signal to walker: {}", err),
         }
 
-        let line = loop_rx.recv().expect("error receiving from channel");
-        let mut ingest_ns = nanotime();
-        let ts = (ingest_ns / 1_000_000) as u64;
-
-        let data = serde_json::to_vec(&json!({
-            "headers": {"hostname": hostname.clone(), "file": source, "ts": ts},
-            "body": line,
-        }));
-
-        if let Ok(data) = data {
-            send_event(
-                &pipelines,
-                &mut preprocessors,
-                &mut codec,
-                &mut metrics_reporter,
-                &mut ingest_ns,
-                &origin_uri,
-                id,
-                data,
-            );
-            id += 1;
+        match source_sender.send(handlers::Msg::Stop) {
+            Ok(_) => info!("ok sending stop signal to source"),
+            Err(err) => error!("error sending stop signal to source: {}", err),
         }
+
+        wait_all(join_handles, config.restore_file.clone());
+        info!("all threads finished, exiting");
     }
+    Ok(())
 }
 
 impl Onramp for LogWatcher {
@@ -161,174 +165,115 @@ impl Onramp for LogWatcher {
     }
 }
 
-#[derive(Debug)]
-pub struct LogWatcherAgent {
-    filename: String,
-    inode: u64,
-    pos: u64,
-    reader: BufReader<File>,
-    finish: bool,
-    regex_list: Vec<Regex>,
-    regex_set: RegexSet,
-    file_lines: Vec<String>,
-    max_lines: usize,
-    wait_for_new_line: i64,
-    last_read: i64,
+fn start_all(
+    content_sender: Sender<Content>,
+    source: SourceSpec,
+    restore_state: RestoreState,
+) -> (
+    Sender<path::WalkerMsg>,
+    Sender<handlers::Msg>,
+    Vec<JoinHandle<ProcessInfo>>,
+) {
+    let mut join_handles = vec![];
+    let handler_receive_timeout = Duration::from_millis(5);
+
+    let matcher = path::MatchRules::new(source.rules.clone());
+    let (walker_sender, walker_receiver) = bounded(0);
+    let (walker_msg_sender, walker_msg_receiver) = bounded(0);
+
+    let walker_handle = path::walkdir_filter_send_thread(
+        &source.path,
+        matcher,
+        walker_sender,
+        walker_msg_receiver,
+        source.walk_interval,
+    );
+
+    let (source_sender, source_receiver) = bounded(0);
+    let source_handle = path::ChangeWatcher::from_restore_state(&restore_state).start(
+        walker_receiver,
+        source_sender.clone(),
+        source.receive_timeout,
+        source.check_interval,
+        source.eviction_interval,
+        source.evict_older_than,
+    );
+
+    let handlers = handlers::Handlers::start(
+        content_sender.clone(),
+        source_receiver,
+        handler_receive_timeout,
+        restore_state.clone(),
+        source.max_lines,
+        source.line_regex.clone(),
+    );
+    join_handles.push(handlers);
+    join_handles.push(walker_handle);
+    join_handles.push(source_handle);
+
+    (walker_msg_sender, source_sender.clone(), join_handles)
 }
 
-impl LogWatcherAgent {
-    pub fn register(
-        filename: String,
-        regex_str: Vec<String>,
-        max_lines: usize,
-        wait_for_new_line: i64,
-    ) -> Result<LogWatcherAgent> {
-        let f = File::open(filename.clone()).expect("error opening file");
-        let metadata = f.metadata().expect("error getting file metadata");
+struct LogWrite;
 
-        let mut reader = BufReader::new(f);
-        let pos = metadata.len();
-        reader
-            .seek(SeekFrom::Start(pos))
-            .expect("seek in file failed");
-
-        let regex_set = RegexSetBuilder::new(&regex_str)
-            .dot_matches_new_line(true)
-            .multi_line(true)
-            .build()
-            .expect("wrong regex");
-
-        let regex_list: Vec<Regex> = regex_str
-            .into_iter()
-            .map(|x| {
-                RegexBuilder::new(&x)
-                    .dot_matches_new_line(true)
-                    .multi_line(true)
-                    .build()
-                    .expect("wrong regex")
-            })
-            .collect();
-
-        let logwatcher_agent = LogWatcherAgent {
-            filename,
-            inode: metadata.ino(),
-            pos,
-            reader,
-            finish: false,
-            regex_list,
-            regex_set,
-            file_lines: Vec::new(),
-            max_lines,
-            last_read: Utc::now().timestamp(),
-            wait_for_new_line,
-        };
-        Ok(logwatcher_agent)
+impl LogWrite {
+    fn new() -> LogWrite {
+        LogWrite {}
     }
+}
 
-    fn reopen_if_log_rotated<F: ?Sized>(&mut self, callback: &mut F)
-    where
-        F: Fn(String),
-    {
-        loop {
-            match File::open(self.filename.clone()) {
-                Ok(x) => {
-                    let f = x;
-                    if let Ok(metadata) = f.metadata() {
-                        if metadata.ino() == self.inode {
-                            thread::sleep(Duration::new(1, 0));
-                        } else {
-                            self.finish = true;
-                            self.watch(callback);
-                            self.finish = false;
-                            info!("reloading log file");
-                            self.reader = BufReader::new(f);
-                            self.pos = 0;
-                            self.inode = metadata.ino();
-                        }
-                        break;
-                    } else {
-                        thread::sleep(Duration::new(1, 0));
-                        continue;
-                    }
-                }
-                Err(err) => {
-                    if err.kind() == ErrorKind::NotFound {
-                        thread::sleep(Duration::new(1, 0));
-                        continue;
-                    }
-                }
-            };
+impl std::io::Write for LogWrite {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match std::str::from_utf8(buf) {
+            Ok(s) => {
+                info!("{}", s);
+                Ok(buf.len())
+            }
+            Err(_) => Ok(0),
         }
     }
 
-    pub fn watch<F: ?Sized>(&mut self, callback: &mut F)
-    where
-        F: Fn(String),
-    {
-        loop {
-            let mut line = String::new();
-            let resp = self.reader.read_line(&mut line);
-            match resp {
-                Ok(len) => {
-                    if len > 0 {
-                        self.pos += len as u64;
-                        self.reader
-                            .seek(SeekFrom::Start(self.pos))
-                            .expect("seek in file failed");
-                        self.last_read = Utc::now().timestamp();
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
-                        self.file_lines.push(line.clone());
-                        line.clear();
-
-                        let mut last_match_index = 0;
-                        let lines_joined = self.file_lines.join("");
-                        let matches: Vec<_> =
-                            self.regex_set.matches(&lines_joined).into_iter().collect();
-
-                        if let Some(regex_matched_index) = matches.first() {
-                            if let Some(first_regex_matched) =
-                                self.regex_list.get(*regex_matched_index)
-                            {
-                                for mat in first_regex_matched.find_iter(&lines_joined) {
-                                    last_match_index = mat.end();
-                                    let sub = &lines_joined[mat.start()..last_match_index];
-                                    callback(sub.to_string());
-                                }
+fn wait_all(join_handles: Vec<JoinHandle<ProcessInfo>>, restore_path: Option<String>) {
+    let mut writer = match restore_path {
+        Some(file_path) => match OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&file_path)
+        {
+            Ok(write_file) => LineWriter::new(Box::new(write_file) as Box<dyn Write>),
+            Err(err) => {
+                error!("can't open restore file {}: {}", file_path, err);
+                LineWriter::new(Box::new(LogWrite::new()) as Box<dyn Write>)
+            }
+        },
+        None => LineWriter::new(Box::new(LogWrite::new()) as Box<dyn Write>),
+    };
+    for handle in join_handles {
+        match handle.join() {
+            Ok(ProcessInfo::Nothing) => {
+                info!("no process info");
+            }
+            Ok(ProcessInfo::HandlerInfo(infos)) => {
+                for info in infos {
+                    if let Some(line) = info.to_line() {
+                        match writer.write_all(line.as_bytes()) {
+                            Ok(_) => {
+                                info!("restore written for file {}", info.path);
+                            }
+                            Err(err) => {
+                                error!("{}", err);
                             }
                         }
-
-                        if last_match_index > 0 {
-                            // if something matched, we keep only the lines after the last matched line
-                            self.file_lines.clear();
-                        }
-
-                        // remove lines while file_lines > max_lines
-                        while self.file_lines.len() > self.max_lines {
-                            self.file_lines.remove(0);
-                        }
-                    } else {
-                        let secs_since_last_read = Utc::now().timestamp() - self.last_read;
-                        if secs_since_last_read > self.wait_for_new_line
-                            && !self.file_lines.is_empty()
-                        {
-                            callback(self.file_lines.join(""));
-                            self.file_lines.clear();
-                        }
-
-                        if self.finish {
-                            break;
-                        } else {
-                            self.reopen_if_log_rotated(callback);
-                            self.reader
-                                .seek(SeekFrom::Start(self.pos))
-                                .expect("seek in file failed");
-                        }
                     }
                 }
-                Err(err) => {
-                    error!("{}", err);
-                }
             }
-        }
+            Err(err) => error!("stop error: {:?}", err),
+        };
     }
 }

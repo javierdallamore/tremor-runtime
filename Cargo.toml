@@ -100,6 +100,10 @@ grok = "1"
 libc = "0.2.53"
 procfs = "0.5.3"
 proc-mounts = "0.2.2"
+serde-humanize-rs = "0.1"
+sha2 = "0.8.0"
+glob = "0.3.0"
+walkdir = "2"
 
 [dependencies.tungstenite]
 version = "0.10"
