@@ -26,16 +26,19 @@
 #![allow(clippy::must_use_candidate)]
 
 use crate::query::Query; // {Query, Return};
-pub use crate::registry::{registry, Registry, TremorFn, TremorFnWrapper};
 use chrono::{Timelike, Utc};
 use clap::{App, Arg};
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::BufReader;
-use std::iter::FromIterator;
-use tremor_pipeline::errors::*;
+use tremor_pipeline::errors::{Error, ErrorKind, Result};
 use tremor_script::highlighter::{Highlighter, Term as TermHighlighter};
-use tremor_script::*;
+use tremor_script::path::load as load_module_path;
+use tremor_script::{
+    lexer, query,
+    registry::{self, Registry},
+    LineValue, Object, Script, ValueAndMeta,
+};
 
 #[allow(clippy::cast_sign_loss)]
 pub fn nanotime() -> u64 {
@@ -90,6 +93,12 @@ fn main() -> Result<()> {
                 .help("Prints the highlighted script."),
         )
         .arg(
+            Arg::with_name("highlight-preprocess-source")
+                .short("p")
+                .takes_value(false)
+                .help("Prints the highlighted preprocessed script."),
+        )
+        .arg(
             Arg::with_name("print-ast")
                 .short("a")
                 .takes_value(false)
@@ -130,7 +139,8 @@ fn main() -> Result<()> {
 
     let aggr_reg = registry::aggr();
 
-    let runnable = match Query::parse(&raw, &reg, &aggr_reg) {
+    let module_path = load_module_path();
+    let runnable = match Query::parse(&module_path, script_file, &raw, vec![], &reg, &aggr_reg) {
         Ok(runnable) => runnable,
         Err(e) => {
             let mut h = TermHighlighter::new();
@@ -149,14 +159,23 @@ fn main() -> Result<()> {
         let mut h = TermHighlighter::new();
         Query::highlight_script_with(&raw, &mut h)?;
     }
+    if matches.is_present("highlight-preprocess-source") {
+        println!();
+        if matches.is_present("print-results-raw") {
+        } else {
+            let mut h = TermHighlighter::new();
+            Query::highlight_preprocess_script_with(script_file, &raw, &mut h)?;
+        }
+    }
+
     if matches.is_present("print-ast") {
-        let ast = serde_json::to_string_pretty(&runnable.0.suffix())?;
+        let ast = simd_json::to_string_pretty(&runnable.0.suffix())?;
         println!();
         let mut h = TermHighlighter::new();
         Query::highlight_script_with(&ast, &mut h)?;
     }
     if matches.is_present("print-ast-raw") {
-        let ast = serde_json::to_string_pretty(&runnable.0.suffix())?;
+        let ast = simd_json::to_string_pretty(&runnable.0.suffix())?;
         println!();
         println!("{}", ast);
     }
@@ -208,7 +227,7 @@ fn main() -> Result<()> {
         input?.read_to_string(&mut raw)?;
         let raw = raw.trim_end().to_string();
 
-        vec![simd_json::borrowed::Value::String(raw.into())]
+        vec![simd_json::borrowed::Value::from(raw)]
     } else {
         vec![simd_json::borrowed::Value::from(Object::default())]
     };
@@ -222,29 +241,10 @@ fn main() -> Result<()> {
     loop {
         for event in &events {
             let value = LineValue::new(vec![], |_| unsafe {
-                std::mem::transmute(ValueAndMeta {
-                    value: event.clone(),
-                    ..ValueAndMeta::default()
-                })
+                std::mem::transmute(ValueAndMeta::from(event.clone()))
             });
             continuation.clear();
             let ingest_ns = nanotime();
-            /*
-            if matches.value_of("replay-influx").is_some() {
-                let this = event
-                    .get("timestamp")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_else(|| id * 1_000_000_000);
-                if this < last {
-                    last += 1;
-                } else {
-                    last = this;
-                }
-                last
-            } else {
-                id * 1_000_000_000
-            };
-            */
             execable.enqueue(
                 "in",
                 tremor_pipeline::Event {
@@ -259,16 +259,18 @@ fn main() -> Result<()> {
             )?;
 
             for (output, event) in continuation.drain(..) {
-                let event = &event.data.suffix().value;
+                let event = event.data.suffix().value();
                 if matches.is_present("quiet") {
                 } else if matches.is_present("print-result-raw") {
-                    println!("{}", serde_json::to_string_pretty(event)?);
+                    println!("{}", simd_json::to_string_pretty(event)?);
                 } else if selected_output.is_none() || selected_output == Some(&output) {
                     println!("{}>>", output);
-                    let result = format!("{} ", serde_json::to_string_pretty(event)?);
-                    let lexed_tokens = Vec::from_iter(lexer::Tokenizer::new(&result));
+                    let result = format!("{} ", simd_json::to_string_pretty(event)?);
+                    let lexed_tokens: Vec<_> = lexer::Tokenizer::new(&result)
+                        .filter_map(std::result::Result::ok)
+                        .collect();
                     let mut h = TermHighlighter::new();
-                    h.highlight(lexed_tokens)?;
+                    h.highlight(Some(script_file), &lexed_tokens)?;
                 }
             }
         }

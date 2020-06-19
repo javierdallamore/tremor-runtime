@@ -61,14 +61,7 @@ pub fn load(registry: &mut Registry) {
 mod test {
     use crate::registry::fun;
     use simd_json::prelude::*;
-    use simd_json::value::borrowed::Object;
     use simd_json::BorrowedValue as Value;
-
-    macro_rules! assert_val {
-        ($e:expr, $r:expr) => {
-            assert_eq!($e, Ok(Value::from($r)))
-        };
-    }
 
     #[test]
     fn is_null() {
@@ -139,7 +132,7 @@ mod test {
         let f = fun("type", "is_record");
         let v = Value::from("this is a test");
         assert_val!(f(&[&v]), false);
-        let v = Value::from(Object::new());
+        let v = Value::object();
         assert_val!(f(&[&v]), true);
     }
 
@@ -158,7 +151,7 @@ mod test {
         assert_val!(f(&[&v]), "string");
         let v = Value::Array(vec![]);
         assert_val!(f(&[&v]), "array");
-        let v = Value::from(Object::new());
+        let v = Value::object();
         assert_val!(f(&[&v]), "record");
     }
 }

@@ -18,22 +18,10 @@
 #![allow(clippy::large_enum_variant)]
 
 use crate::async_sink;
-use base64;
-use chrono;
-use elastic;
-use error_chain::*;
-use grok;
+use error_chain::error_chain;
 use hdrhistogram::{self, serialization as hdr_s};
-use log4rs;
-use rdkafka;
-use rental;
-use rmp_serde;
-use serde_json;
-use serde_yaml;
-use std;
+
 use tremor_influx as influx;
-use tremor_pipeline;
-use url;
 
 impl Clone for Error {
     fn clone(&self) -> Self {
@@ -83,6 +71,12 @@ impl From<http_types::Error> for Error {
     }
 }
 
+impl From<glob::PatternError> for Error {
+    fn from(e: glob::PatternError) -> Self {
+        Self::from(format!("{}", e))
+    }
+}
+
 #[cfg(feature = "gcp")]
 impl From<google_storage1::Error> for Error {
     fn from(e: google_storage1::Error) -> Self {
@@ -105,6 +99,11 @@ impl<T> From<crossbeam_channel::SendError<T>> for Error {
 impl From<crossbeam_channel::RecvError> for Error {
     fn from(e: crossbeam_channel::RecvError) -> Self {
         Self::from(format!("{:?}", e))
+    }
+}
+impl From<tremor_script::errors::CompilerError> for Error {
+    fn from(e: tremor_script::errors::CompilerError) -> Self {
+        e.error().into()
     }
 }
 
@@ -137,7 +136,6 @@ error_chain! {
         Base64Error(base64::DecodeError);
         YAMLError(serde_yaml::Error) #[doc = "Error during yaml parsing"];
         JSONError(simd_json::Error);
-        SerdeError(serde_json::Error);
         Io(std::io::Error);
         SinkDequeueError(async_sink::SinkDequeueError);
         SinkEnqueueError(async_sink::SinkEnqueueError);
@@ -159,13 +157,10 @@ error_chain! {
         RegexError(regex::Error);
         WsError(tungstenite::Error);
         InfluxEncoderError(influx::EncoderError);
+        AsyncRecvError(async_std::sync::RecvError);
     }
 
     errors {
-        AsyncRecvError {
-            description("Failed to recive from a task")
-                display("Failed to recive from a task")
-        }
         UnknownOp(n: String, o: String) {
             description("Unknown operator")
                 display("Unknown operator: {}::{}", n, o)

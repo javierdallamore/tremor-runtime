@@ -14,7 +14,6 @@
 
 use crate::registry::Registry;
 use crate::tremor_const_fn;
-use serde_json;
 use simd_json::to_owned_value;
 
 pub fn load(registry: &mut Registry) {
@@ -30,10 +29,10 @@ pub fn load(registry: &mut Registry) {
             to_owned_value(&mut bytes).map_err(to_runtime_error).map(Value::from)
         }))
         .insert(tremor_const_fn! (json::encode(_context, _input) {
-            serde_json::to_string(_input).map(Value::from).map_err(to_runtime_error)
+            simd_json::to_string(_input).map(Value::from).map_err(to_runtime_error)
         }))
         .insert(tremor_const_fn! (json::encode_pretty(_context, _input) {
-            serde_json::to_string_pretty(_input).map(Value::from).map_err(to_runtime_error)
+            simd_json::to_string_pretty(_input).map(Value::from).map_err(to_runtime_error)
         }));
 }
 
@@ -42,45 +41,22 @@ mod test {
     use crate::registry::fun;
     use simd_json::BorrowedValue as Value;
 
-    macro_rules! assert_val {
-        ($e:expr, $r:expr) => {
-            assert_eq!($e, Ok(Value::from($r)))
-        };
-    }
     #[test]
     fn decode() {
         let f = fun("json", "decode");
         let v = Value::from(r#"["this","is","a","cake"]"#);
-        assert_val!(
-            f(&[&v]),
-            Value::Array(vec![
-                Value::from("this"),
-                Value::from("is"),
-                Value::from("a"),
-                Value::from("cake")
-            ])
-        );
+        assert_val!(f(&[&v]), Value::from(vec!["this", "is", "a", "cake"]));
     }
     #[test]
     fn encode() {
         let f = fun("json", "encode");
-        let v = Value::Array(vec![
-            Value::from("this"),
-            Value::from("is"),
-            Value::from("a"),
-            Value::from("cake"),
-        ]);
+        let v = Value::from(vec!["this", "is", "a", "cake"]);
         assert_val!(f(&[&v]), Value::from(r#"["this","is","a","cake"]"#));
     }
     #[test]
     fn encode_pretty() {
         let f = fun("json", "encode_pretty");
-        let v = Value::Array(vec![
-            Value::from("this"),
-            Value::from("is"),
-            Value::from("a"),
-            Value::from("cake"),
-        ]);
+        let v = Value::from(vec!["this", "is", "a", "cake"]);
         assert_val!(
             f(&[&v]),
             Value::from(

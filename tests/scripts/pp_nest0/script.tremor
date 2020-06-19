@@ -1,0 +1,6 @@
+use foo;
+
+match event of
+  case {} => "snot {foo::snot}"
+  default => "ko"
+end;

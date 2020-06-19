@@ -23,10 +23,19 @@ use tremor_pipeline::FN_REGISTRY;
 use tremor_runtime;
 use tremor_runtime::errors::*;
 use tremor_script::highlighter::{Dumb, Highlighter};
+use tremor_script::path::ModulePath;
 
-fn to_pipe(query: &str) -> Result<ExecutableGraph> {
+fn to_pipe(module_path: &ModulePath, file_name: &str, query: &str) -> Result<ExecutableGraph> {
     let aggr_reg = tremor_script::aggr_registry();
-    let q = Query::parse(query, &*FN_REGISTRY.lock()?, &aggr_reg)?;
+    let cus = vec![];
+    let q = Query::parse(
+        module_path,
+        query,
+        file_name,
+        cus,
+        &*FN_REGISTRY.lock()?,
+        &aggr_reg,
+    )?;
     Ok(q.to_pipe()?)
 }
 
@@ -38,9 +47,11 @@ macro_rules! test_cases {
             fn $file() -> Result<()> {
 
                 tremor_runtime::functions::load()?;
+                let query_dir = concat!("tests/query_errors/", stringify!($file), "/").to_string();
                 let query_file = concat!("tests/query_errors/", stringify!($file), "/query.trickle");
                 let err_file = concat!("tests/query_errors/", stringify!($file), "/error.txt");
                 let err_re_file = concat!("tests/query_errors/", stringify!($file), "/error.re");
+                let module_path = &ModulePath { mounts: vec![query_dir] };
 
                 println!("Loading query: {}", query_file);
                 let mut file = File::open(query_file)?;
@@ -55,7 +66,7 @@ macro_rules! test_cases {
                     let err = err.trim();
                     let re = Regex::new(err)?;
 
-                    let s = to_pipe(&contents);
+                    let s = to_pipe(&module_path, err_re_file, &contents);
                     if let Err(e) = s {
                         println!("{} ~ {}", err, format!("{}", e));
                         assert!(re.is_match(&format!("{}", e)));
@@ -70,9 +81,18 @@ macro_rules! test_cases {
                     file.read_to_string(&mut err)?;
                     let err = err.trim();
 
-                    match to_pipe(&contents) {
+                    match to_pipe(&module_path, err_file, &contents) {
                         Err(Error(ErrorKind::Pipeline(tremor_pipeline::errors::ErrorKind::Script(e)), o)) =>{
-                            dbg!(&e);
+                            let e = tremor_script::errors::Error(e, o);
+                            let mut h = Dumb::new();
+                            tremor_script::query::Query::format_error_from_script(&contents, &mut h, &e)?;
+                            h.finalize()?;
+                            let got = h.to_string();
+                            let got = got.trim();
+                            println!("{}", got);
+                            assert_eq!(err, got);
+                        }
+                        Err(Error(ErrorKind::Script(e), o)) =>{
                             let e = tremor_script::errors::Error(e, o);
                             let mut h = Dumb::new();
                             tremor_script::query::Query::format_error_from_script(&contents, &mut h, &e)?;
@@ -105,4 +125,14 @@ test_cases!(
     local_in_select,
     local_in_where,
     local_in_group_by,
+    pp_unrecognized_token,
+    pp_unrecognized_token2,
+    pp_unrecognized_token3,
+    pp_unrecognized_token4,
+    pp_unrecognized_token5,
+    pp_embed_unrecognized_token,
+    pp_embed_unrecognized_token2,
+    pp_embed_unrecognized_token3,
+    pp_embed_unrecognized_token4,
+    pp_embed_unrecognized_token5,
 );

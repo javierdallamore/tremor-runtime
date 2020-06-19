@@ -17,10 +17,7 @@
 #![allow(clippy::large_enum_variant)]
 #![allow(missing_docs)]
 
-use error_chain::*;
-use regex;
-use serde_yaml;
-use std;
+use error_chain::error_chain;
 impl<P> From<std::sync::PoisonError<P>> for Error {
     fn from(e: std::sync::PoisonError<P>) -> Self {
         Self::from(format!("Poison Error: {:?}", e))
@@ -39,7 +36,6 @@ error_chain! {
     foreign_links {
         YAMLError(serde_yaml::Error) #[doc = "Error during yaml parsing"];
         JSONError(simd_json::Error);
-        SerdeError(serde_json::Error);
         Io(std::io::Error);
         FromUTF8Error(std::string::FromUtf8Error);
         UTF8Error(std::str::Utf8Error);

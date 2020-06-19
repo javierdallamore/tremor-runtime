@@ -21,23 +21,37 @@
 use crate::ast::{self, BaseExpr, Expr, Ident, NodeMetas};
 use crate::errors;
 use crate::lexer;
+use crate::path::ModulePath;
 use crate::pos;
 use crate::pos::{Location, Range};
-use base64;
-use dissect;
 use error_chain::error_chain;
-use glob;
-use grok;
-use lalrpop_util;
 use lalrpop_util::ParseError as LalrpopError;
-use regex;
 use serde::{Deserialize, Serialize};
-use serde_json;
 pub use simd_json::ValueType;
 use simd_json::{prelude::*, BorrowedValue as Value};
 use std::num;
 use std::ops::{Range as RangeExclusive, RangeInclusive};
-use url;
+
+/// A Compiletime error capturing the prerpocessors cus at the time of the error
+#[derive(Debug)]
+pub struct CompilerError {
+    /// The original error
+    pub error: Error,
+    /// The cus
+    pub cus: Vec<lexer::CompilationUnit>,
+}
+
+impl CompilerError {
+    /// Turns this into the underlying error
+    pub fn error(self) -> Error {
+        self.error
+    }
+}
+impl From<CompilerError> for Error {
+    fn from(e: CompilerError) -> Self {
+        e.error()
+    }
+}
 
 #[doc(hidden)]
 /// Optimised try
@@ -65,6 +79,12 @@ type ParserError<'screw_lalrpop> =
 impl From<url::ParseError> for Error {
     fn from(e: url::ParseError) -> Self {
         Self::from(format!("Url Parse Error: {}", e))
+    }
+}
+
+impl From<Error> for std::io::Error {
+    fn from(e: Error) -> Self {
+        std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e))
     }
 }
 
@@ -129,12 +149,28 @@ pub(crate) fn best_hint(
         .map(|(d, s)| (d, s.clone()))
 }
 pub(crate) type ErrorLocation = (Option<Range>, Option<Range>);
-// FIXME: Option<(Location, Location, Option<(Location, Location)>)>
 impl ErrorKind {
+    pub(crate) fn cu(&self) -> usize {
+        self.expr().0.map(Range::cu).unwrap_or_default()
+    }
     pub(crate) fn expr(&self) -> ErrorLocation {
-        use ErrorKind::*;
+        use ErrorKind::{
+            AggrInAggr, ArrayOutOfRange, AssignIntoArray, AssignToConst, BadAccessInEvent,
+            BadAccessInGlobal, BadAccessInLocal, BadAccessInState, BadArity, BadArrayIndex,
+            BadType, BinaryDrop, BinaryEmit, DecreasingRange, DoubleConst, DoubleStream,
+            EmptyScript, ExtraToken, Generic, Grok, InvalidAssign, InvalidBinary, InvalidBitshift,
+            InvalidConst, InvalidDrop, InvalidEmit, InvalidExtractor, InvalidFloatLiteral,
+            InvalidFn, InvalidHexLiteral, InvalidInfluxData, InvalidIntLiteral, InvalidMod,
+            InvalidRecur, InvalidToken, InvalidUnary, Io, JSONError, MergeTypeConflict,
+            MissingEffectors, MissingFunction, MissingModule, ModuleNotFound, Msg, NoClauseHit,
+            NoConstsAllowed, NoLocalsAllowed, NoObjectError, NotConstant, NotFound, Oops,
+            ParseIntError, ParserError, PatchKeyExists, PreprocessorError, QueryStreamNotDefined,
+            RuntimeError, TailingHereDoc, TypeConflict, UnexpectedCharacter, UnexpectedEndOfStream,
+            UnexpectedEscapeCode, UnrecognizedToken, UnterminatedExtractor, UnterminatedHereDoc,
+            UnterminatedIdentLiteral, UnterminatedStringLiteral, UpdateKeyMissing, Utf8Error,
+        };
         match self {
-            NoClauseHit(outer) | Oops(outer, _) => (Some(outer.expand_lines(2)), Some(*outer)),
+            NoClauseHit(outer) | Oops(outer, _, _) => (Some(outer.expand_lines(2)), Some(*outer)),
             QueryStreamNotDefined(outer, inner, _)
             | ArrayOutOfRange(outer, inner, _, _)
             | AssignIntoArray(outer, inner)
@@ -155,10 +191,13 @@ impl ErrorKind {
             | InvalidBitshift(outer, inner)
             | InvalidDrop(outer, inner)
             | InvalidEmit(outer, inner)
+            | InvalidRecur(outer, inner)
             | InvalidConst(outer, inner)
+            | InvalidMod(outer, inner)
             | InvalidFn(outer, inner)
             | AssignToConst(outer, inner, _)
             | DoubleConst(outer, inner, _)
+            | DoubleStream(outer, inner, _)
             | InvalidExtractor(outer, inner, _, _, _)
             | InvalidFloatLiteral(outer, inner)
             | InvalidHexLiteral(outer, inner)
@@ -169,6 +208,7 @@ impl ErrorKind {
             | MissingEffectors(outer, inner)
             | MissingFunction(outer, inner, _, _, _)
             | MissingModule(outer, inner, _, _)
+            | ModuleNotFound(outer, inner, _, _)
             | NoLocalsAllowed(outer, inner)
             | NoConstsAllowed(outer, inner)
             | RuntimeError(outer, inner, _, _, _, _)
@@ -182,6 +222,7 @@ impl ErrorKind {
             | UpdateKeyMissing(outer, inner, _)
             | UnterminatedHereDoc(outer, inner, _)
             | TailingHereDoc(outer, inner, _, _)
+            | Generic(outer, inner, _)
             | AggrInAggr(outer, inner)
             | NotConstant(outer, inner) => (Some(*outer), Some(*inner)),
             // Special cases
@@ -195,14 +236,17 @@ impl ErrorKind {
             | Msg(_)
             | ParseIntError(_)
             | ParserError(_)
-            | SerdeJSONError(_)
+            | PreprocessorError(_)
             | UnexpectedEndOfStream
             | Utf8Error(_)
             | Self::__Nonexhaustive { .. } => (Some(Range::default()), None),
         }
     }
     pub(crate) fn token(&self) -> Option<String> {
-        use ErrorKind::*;
+        use ErrorKind::{
+            UnexpectedEscapeCode, UnterminatedExtractor, UnterminatedIdentLiteral,
+            UnterminatedStringLiteral,
+        };
         match self {
             UnterminatedExtractor(_, _, token)
             | UnterminatedStringLiteral(_, _, token)
@@ -212,7 +256,10 @@ impl ErrorKind {
         }
     }
     pub(crate) fn hint(&self) -> Option<String> {
-        use ErrorKind::*;
+        use ErrorKind::{
+            BadAccessInEvent, BadAccessInGlobal, BadAccessInLocal, MissingFunction, MissingModule,
+            NoClauseHit, Oops, TypeConflict, UnrecognizedToken,
+        };
         match self {
             UnrecognizedToken(outer, inner, t, _) if t == "" && inner.0.absolute == outer.1.absolute => Some("It looks like a `;` is missing at the end of the script".into()),
             UnrecognizedToken(_, _, t, _) if t == "default" || t == "case" => Some("You might have a trailing `,` in the prior statement".into()),
@@ -257,16 +304,22 @@ impl ErrorKind {
             MissingModule(_, _, _, Some((_, suggestion))) | MissingFunction(_, _, _, _, Some((_, suggestion))) => Some(format!("Did you mean `{}`?", suggestion)),
 
             NoClauseHit(_) => Some("Consider adding a `default => null` clause at the end of your match or validate full coverage beforehand.".into()),
-            Oops(_, _) => Some("Please take the error output script and test data and open a ticket, this should not happen.".into()),
+            Oops(_, id, _) => Some(format!("Please take the error output script and test data and open a ticket, this should not happen.\nhttps://github.com/wayfair-tremor/tremor-runtime/issues/new?labels=bug&template=bug_report.md&title=Opps%20{}", id)),
             _ => None,
         }
     }
 }
 
 impl Error {
-    pub(crate) fn context(&self) -> ErrorLocation {
+    /// the context of the error
+    pub fn context(&self) -> ErrorLocation {
         self.0.expr()
     }
+    /// The compilation unit
+    pub fn cu(&self) -> usize {
+        self.0.cu()
+    }
+
     pub(crate) fn hint(&self) -> Option<String> {
         self.0.hint()
     }
@@ -299,7 +352,6 @@ error_chain! {
         Io(std::io::Error);
         JSONError(simd_json::Error);
         ParseIntError(num::ParseIntError);
-        SerdeJSONError(serde_json::Error);
         Utf8Error(std::str::Utf8Error);
         NoObjectError(simd_json::KnownKeyError);
     }
@@ -323,6 +375,11 @@ error_chain! {
         /*
          * Generic
          */
+        Generic(expr: Range, inner: Range, msg: String) {
+            description("Generic error")
+                display("{}", msg)
+        }
+
         EmptyScript {
             description("No expressions were found in the script")
                 display("No expressions were found in the script")
@@ -335,7 +392,7 @@ error_chain! {
             description("Conflicting types")
                 display("Conflicting types, got {} but expected {}", t2s(*got), choices(&expected.iter().map(|v| t2s(*v).to_string()).collect::<Vec<String>>()))
         }
-        Oops(expr: Range, msg: String) {
+        Oops(expr: Range, id: u64, msg: String) {
             description("Something went wrong and we're not sure what it was")
                 display("Something went wrong and we're not sure what it was: {}", msg)
         }
@@ -354,9 +411,9 @@ error_chain! {
             description("Call to undefined module")
                 display("Call to undefined module {}", m)
         }
-        MissingFunction(expr: Range, inner: Range, m: String, f: String, suggestion: Option<(usize, String)>) {
+        MissingFunction(expr: Range, inner: Range, m: Vec<String>, f: String, suggestion: Option<(usize, String)>) {
             description("Call to undefined function")
-                display("Call to undefined function {}::{}", m, f)
+                display("Call to undefined function {}::{}", m.join("::"), f)
         }
         AggrInAggr(expr: Range, inner: Range) {
             description("Aggregates can not be called inside of aggregates")
@@ -370,8 +427,12 @@ error_chain! {
             description("Runtime error in function")
                 display("Runtime error in function {}::{}/{}: {}", m, f, a, c)
         }
+        InvalidRecur(expr: Range, inner: Range) {
+            description("Can not recur from this location")
+                display("Can not recur from this location")
+        }
         /*
-         * Lexer and Parser
+         * Lexer, Preprocessor and Parser
          */
         UnterminatedExtractor(expr: Range, inner: Range, extractor: String) {
             description("Unterminated extractor")
@@ -433,6 +494,22 @@ error_chain! {
                 display("An unexpected end of stream was found")
 
         }
+
+        /*
+         * Preprocessor
+         */
+         PreprocessorError(msg: String) {
+            description("Preprocessor due to user error")
+                display("Preprocessor due to user error: {}", msg)
+         }
+
+        ModuleNotFound(range: Range, loc: Range, resolved_relative_file_path: String, expected: Vec<String>) {
+            description("Module not found")
+                display("Module `{}` not found or not readable error in module path: {}",
+                resolved_relative_file_path.trim(),
+                expected.iter().map(|x| format!("\n                         - {}", x)).collect::<Vec<String>>().join(""))
+        }
+
 
         /*
          * Parser
@@ -497,7 +574,10 @@ error_chain! {
             description("Can't declare a const here")
                 display("Can't declare a const here")
         }
-
+        InvalidMod(expr: Range, inner: Range) {
+            description("Can't declare a module here")
+                display("Can't declare a module here")
+        }
         InvalidFn(expr: Range, inner: Range) {
             description("Can't declare a function here")
                 display("Can't declare a function here")
@@ -505,6 +585,10 @@ error_chain! {
         DoubleConst(expr: Range, inner: Range, name: String) {
             description("Can't declare a constant twice")
                 display("Can't declare the constant `{}` twice", name)
+        }
+        DoubleStream(expr: Range, inner: Range, name: String) {
+            description("Can't declare a stream twice")
+                display("Can't declare the stream `{}` twice", name)
         }
         AssignToConst(expr: Range, inner: Range, name: String) {
             description("Can't assign to a constant")
@@ -516,7 +600,6 @@ error_chain! {
         InvalidEmit(expr: Range, inner: Range) {
             description("Can not emit from this location")
                 display("Can not emit from this location")
-
         }
         InvalidDrop(expr: Range, inner: Range) {
             description("Can not drop from this location")
@@ -616,18 +699,21 @@ pub fn query_stream_not_defined<T, S: BaseExpr, I: BaseExpr>(
 /// Creates a guard not bool error
 #[allow(clippy::borrowed_box)]
 pub fn query_guard_not_bool<T, O: BaseExpr, I: BaseExpr>(
-    stmt: &Box<O>,
+    stmt: &O,
     inner: &I,
-    _got: &Value,
+    got: &Value,
     meta: &NodeMetas,
 ) -> Result<T> {
-    // FIXME Should actually say expected/actualf or type ( error_type_conflict )
-    Err(ErrorKind::QueryStreamNotDefined(
-        stmt.extent(meta),
-        inner.extent(meta),
-        "snot at error type conflict".to_string(),
-    )
-    .into())
+    error_type_conflict_mult(stmt, inner, got.value_type(), vec![ValueType::Bool], meta)
+}
+
+pub(crate) fn error_generic<T, O: BaseExpr, I: BaseExpr, S: ToString>(
+    outer: &O,
+    inner: &I,
+    error: &S,
+    meta: &NodeMetas,
+) -> Result<T> {
+    Err(ErrorKind::Generic(outer.extent(meta), inner.extent(meta), error.to_string()).into())
 }
 
 pub(crate) fn error_type_conflict_mult<T, O: BaseExpr, I: BaseExpr>(
@@ -755,10 +841,11 @@ pub(crate) fn error_no_clause_hit<T, O: BaseExpr>(outer: &O, meta: &NodeMetas) -
 
 pub(crate) fn error_oops<T, O: BaseExpr, S: ToString + ?Sized>(
     outer: &O,
+    id: u64,
     msg: &S,
     meta: &NodeMetas,
 ) -> Result<T> {
-    Err(ErrorKind::Oops(outer.extent(meta), msg.to_string()).into())
+    Err(ErrorKind::Oops(outer.extent(meta), id, msg.to_string()).into())
 }
 
 pub(crate) fn error_patch_key_exists<T, O: BaseExpr, I: BaseExpr>(

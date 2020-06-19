@@ -12,18 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(feature = "fns")]
 mod custom_fn;
-#[cfg(feature = "fns")]
-use crate::ast::Warning;
-#[cfg(feature = "fns")]
-pub use custom_fn::*;
-
+pub(crate) use self::custom_fn::{CustomFn, RECUR, RECUR_PTR};
 use crate::ast::{BaseExpr, NodeMetas};
-use crate::errors::*;
+use crate::errors::{best_hint, Error, ErrorKind, Result};
 use crate::utils::hostname as get_hostname;
 use crate::{tremor_fn, EventContext};
-use chrono::{Timelike, Utc};
 use downcast_rs::{impl_downcast, DowncastSync};
 use halfbrown::HashMap;
 use simd_json::BorrowedValue as Value;
@@ -97,18 +91,16 @@ pub type FResult<T> = std::result::Result<T, FunctionError>;
 pub fn registry() -> Registry {
     let mut registry = Registry::default();
 
-    registry.insert(tremor_fn!(system::hostname(_context) {
-        Ok(Value::from( get_hostname()))
-    }));
-
-    registry.insert(tremor_fn!(system::ingest_ns(_context) {
-        let now = Utc::now();
-        #[allow(clippy::cast_sign_loss)]
-        let seconds: u64 = now.timestamp() as u64;
-        let nanoseconds: u64 = u64::from(now.nanosecond());
-
-        Ok(Value::from((seconds * 1_000_000_000) + nanoseconds))
-    }));
+    registry
+        .insert(tremor_fn!(system::hostname(_context) {
+            Ok(Value::from( get_hostname()))
+        }))
+        .insert(tremor_fn! (system::ingest_ns(ctx) {
+            Ok(Value::from(ctx.ingest_ns()))
+        }))
+        .insert(tremor_fn!(system::instance(_context) {
+            Ok(Value::from("tremor-script"))
+        }));
 
     crate::std_lib::load(&mut registry);
     registry
@@ -189,7 +181,7 @@ pub enum FunctionError {
         mfa: MFA,
     },
     /// A generic error
-    Error(Error),
+    Error(Box<Error>),
 }
 
 impl PartialEq for FunctionError {
@@ -200,7 +192,7 @@ impl PartialEq for FunctionError {
 
 impl From<Error> for FunctionError {
     fn from(error: Error) -> Self {
-        Self::Error(error)
+        Self::Error(Box::new(error))
     }
 }
 
@@ -213,7 +205,9 @@ impl FunctionError {
         registry: Option<&Registry>,
         meta: &NodeMetas,
     ) -> crate::errors::Error {
-        use FunctionError::*;
+        use FunctionError::{
+            BadArity, BadType, Error, MissingFunction, MissingModule, RuntimeError,
+        };
         let outer = outer.extent(meta);
         let inner = inner.extent(meta);
         match self {
@@ -244,10 +238,10 @@ impl FunctionError {
                 } else {
                     None
                 };
-                ErrorKind::MissingFunction(outer, inner, m, f, suggestion).into()
+                ErrorKind::MissingFunction(outer, inner, vec![m], f, suggestion).into()
             }
             BadType { mfa } => ErrorKind::BadType(outer, inner, mfa.m, mfa.f, mfa.a).into(),
-            Error(e) => e,
+            Error(e) => *e,
         }
     }
 }
@@ -599,39 +593,6 @@ impl Registry {
             self.functions.insert(module_name, module);
         }
         self
-    }
-
-    /// Loads a module with function definitions
-    #[cfg(feature = "fns")]
-    pub fn load_module(&mut self, name: &str, code: &str) -> Result<Vec<Warning>> {
-        use crate::lexer::{self};
-        use crate::parser::grammar;
-        if self.functions.contains_key(name) {
-            return Err(format!("Module {} already exists.", name).into());
-        }
-        let mut source = code.to_string();
-        source.push(' ');
-
-        let lexemes: Result<Vec<_>> = lexer::Tokenizer::new(&source).collect();
-        let mut filtered_tokens = Vec::new();
-
-        for t in lexemes? {
-            let keep = !t.value.is_ignorable();
-            if keep {
-                filtered_tokens.push(Ok(t));
-            }
-        }
-
-        let mut module = HashMap::new();
-
-        let fake_aggr_reg = Aggr::default();
-        let warnings = grammar::ScriptParser::new()
-            .parse(filtered_tokens)?
-            .load_module(name, &mut module, &self, &fake_aggr_reg)?;
-        let module_name = name.to_string();
-        self.functions.insert(module_name, module);
-        self.modules.push(source);
-        Ok(warnings)
     }
 
     /// Finds a module in the registry

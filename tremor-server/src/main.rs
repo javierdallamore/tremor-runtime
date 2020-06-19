@@ -25,13 +25,13 @@
 )]
 #![allow(clippy::must_use_candidate)]
 
-#[cfg(feature = "mimalloc")]
+#[cfg(feature = "allocator-mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-#[cfg(feature = "snmalloc")]
+#[cfg(feature = "allocator-snmalloc")]
 #[global_allocator]
 static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
-#[cfg(feature = "jemalloc")]
+#[cfg(feature = "allocator-jemalloc")]
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
@@ -40,12 +40,11 @@ extern crate log;
 
 mod args;
 
-use crate::errors::*;
+use crate::errors::{Error, Result};
 use crate::system::World;
 use crate::url::TremorURL;
 use async_std::task;
-use env_logger;
-use serde_yaml;
+use human_panic::setup_panic;
 use std::fs::File;
 use std::io::BufReader;
 use std::mem;
@@ -129,8 +128,15 @@ async fn load_query_file(world: &World, file_name: &str) -> Result<usize> {
 
     // FIXME: We should have them constanted
     let aggr_reg = tremor_script::registry::aggr();
-
-    let query = Query::parse(&raw, &*FN_REGISTRY.lock()?, &aggr_reg)?;
+    let module_path = tremor_script::path::load();
+    let query = Query::parse(
+        &module_path,
+        &raw,
+        file_name,
+        vec![],
+        &*FN_REGISTRY.lock()?,
+        &aggr_reg,
+    )?;
 
     let id = TremorURL::parse(&format!("/pipeline/{}", id))?;
     info!("Loading {} from file.", id);
@@ -148,11 +154,11 @@ async fn load_query_file(world: &World, file_name: &str) -> Result<usize> {
 //         Err(e) => Ok(e.into()),
 //     }
 // }
-fn fix_tide(r: api::Result<tide::Response>) -> tide::Response {
-    match r {
+fn fix_tide(r: api::Result<tide::Response>) -> tide::Result {
+    Ok(match r {
         Ok(r) => r,
         Err(e) => e.into(),
-    }
+    })
 }
 
 #[cfg_attr(tarpaulin, skip)]
@@ -165,6 +171,7 @@ async fn run_dun() -> Result<()> {
     // Logging
 
     if let Some(logger_config) = matches.value_of("logger") {
+        eprintln!("Reading logger config file: {}", logger_config);
         log4rs::init_file(logger_config, log4rs::file::Deserializers::default())?;
     } else {
         env_logger::init();
@@ -185,6 +192,17 @@ async fn run_dun() -> Result<()> {
         metrics::INSTANCE = forget_s;
     }
 
+    unsafe {
+        // We know that recursion-limit will only get set once at
+        // the very beginning nothing can access it yet,
+        // this makes it allowable to use unsafe here.
+        let l: u32 = matches
+            .value_of("recursion-limit")
+            .and_then(|l| l.parse().ok())
+            .ok_or_else(|| Error::from("invalid recursion limit"))?;
+        tremor_script::RECURSION_LIMIT = l;
+    }
+
     let storage_directory = matches
         .value_of("storage-directory")
         .map(std::string::ToString::to_string);
@@ -192,15 +210,33 @@ async fn run_dun() -> Result<()> {
     let (world, handle) = World::start(64, storage_directory).await?;
 
     // We load queries first since those are only pipelines.
-    if let Some(query_files) = matches.values_of("query") {
+    let query_files: Vec<String> = match matches.values_of("query") {
+        Some(files) => files.map(String::from).collect(),
+        // read from default query file(s) now (returns empty if these paths don't exist too)
+        None => glob::glob("/etc/tremor/config/*.trickle")?
+            .filter_map(|p| p.ok().map(|p| p.display().to_string()))
+            .collect(),
+    };
+    if !query_files.is_empty() {
+        eprintln!("Reading the query files: {}", query_files.join(","));
+        info!("Reading the query files: {}", query_files.join(","));
         for query_file in query_files {
-            load_query_file(&world, query_file).await?;
+            load_query_file(&world, &query_file).await?;
         }
     }
 
-    if let Some(config_files) = matches.values_of("config") {
+    let config_files: Vec<String> = match matches.values_of("config") {
+        Some(files) => files.map(String::from).collect(),
+        // read from default config file(s) now (returns empty if these paths don't exist too)
+        None => glob::glob("/etc/tremor/config/*.yaml")?
+            .filter_map(|p| p.ok().map(|p| p.display().to_string()))
+            .collect(),
+    };
+    if !config_files.is_empty() {
+        eprintln!("Reading the config files: {}", config_files.join(","));
+        info!("Reading the config files: {}", config_files.join(","));
         for config_file in config_files {
-            load_file(&world, config_file).await?;
+            load_file(&world, &config_file).await?;
         }
     }
 
@@ -261,6 +297,13 @@ async fn run_dun() -> Result<()> {
 
 #[cfg_attr(tarpaulin, skip)]
 fn main() {
+    // ALLOW: this is a handler, not a panic
+    setup_panic!(Metadata {
+        name: env!("CARGO_PKG_NAME").into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        authors: "The Tremor Team".into(),
+        homepage: "https://github.com/wayfair-tremor/tremor-runtime".into(),
+    });
     version::print();
     if let Err(ref e) = task::block_on(run_dun()) {
         error!("error: {}", e);

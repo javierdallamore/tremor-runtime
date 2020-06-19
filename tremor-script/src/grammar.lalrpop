@@ -14,7 +14,7 @@
 
 use crate::ast::raw::*;
 use crate::ast::query::raw::*;
-use crate::ast::{BinOpKind, UnaryOpKind};
+use crate::ast::{BinOpKind, UnaryOpKind, LexicalUnit};
 use crate::lexer::Token;
 use crate::pos::Location;
 use simd_json::{BorrowedValue as Value};
@@ -24,20 +24,91 @@ use std::borrow::Cow;
 grammar<'input>;
 
 ////////////////////////////// Root statements //////////////////////////////
-// These statments for the root of the language.
+// These statements for the root of the language.
 
 /// Root
 pub(crate) Query : QueryRaw<'input> = {
-    <stmts:Stmts> "<end-of-stream>"? => QueryRaw{stmts},
+    <config:ConfigDirectives> <stmts:Stmts> "<end-of-stream>"? => QueryRaw{config, stmts},
+    <stmts:Stmts> "<end-of-stream>"? => QueryRaw{config: vec![], stmts},
 }
 
+ConfigDirectives: WithExprsRaw<'input> = {
+    <directive:ConfigDirective> <directives:ConfigDirectives> => {
+        let mut directives = directives;
+        directives.insert(0, directive);
+        directives 
+    },
+    <directive:ConfigDirective> => vec![directive]
+}
+
+ConfigDirective: (IdentRaw<'input>, ImutExprRaw<'input>) = {
+    "#!config" <WithExpr> => <>
+}
+
+
 Stmts: StmtsRaw<'input> = {
-  <stmt:Stmt> ";" <list:Stmts> => {
-    let mut list = list;
-    list.insert(0,stmt);
-    list
+    <stmt:Stmt> ";" <list:Stmts> => {
+      let mut list = list;
+      list.insert(0,stmt);
+      list
   },
   <item:Stmt> ";"? => vec![item],
+}
+
+ModuleStmt: ModuleStmtRaw<'input> = {
+    <start:@L> "mod" <name:Ident> "with" <doc:ModComment> <stmts:ModuleStmts> "end" <end:@L> => ModuleStmtRaw{name, start, end, stmts, doc: doc},
+    
+}
+
+/// List of expressions at the root of the script
+ModuleStmts: StmtsRaw<'input> = {
+    //<stmt:Stmt> ";" <list:ModuleStmts> => {
+    //    let mut list = list;
+    //    list.insert(0,stmt);
+    //    list
+    // },
+    //<item:Stmt> ";"? => vec![item],
+     <stmt:ModuleInnerStmt> ";" <list:ModuleStmts> => {
+        let mut list = list;
+        list.insert(0,stmt);
+        list
+     },
+     <item:ModuleInnerStmt> ";"? => vec![item],
+ }
+
+// In case we need to limit the content of stmt
+ModuleInnerStmt: StmtRaw<'input> = {
+    <m:ModuleStmt> => StmtRaw::ModuleStmt(m),
+    <start:@L> "define" <kind:WindowKind> "window" <id:Ident> <params:WithScriptClause> <end:@L> => StmtRaw::WindowDecl(WindowDeclRaw { start, end, id: id.id.to_string(), kind, params: params.0, script: params.1 }),
+
+    <start:@L> "define" <kind:OperatorKind> "operator" <id:Ident> <params:WithClause> <end:@L> => StmtRaw::OperatorDecl(Box::new(OperatorDeclRaw { start, end, kind, id: id.id.to_string(), params: Some(params) })),
+    <start:@L> "define" <kind:OperatorKind> "operator" <id:Ident>  <end:@L> => StmtRaw::OperatorDecl(Box::new(OperatorDeclRaw { start, end, kind, id: id.id.to_string(), params: None })),
+
+    <start:@L> "define" "script" <id:Ident> <params:ScriptWithClause> <script:EmbeddedScript> <end:@L> => StmtRaw::ScriptDecl(ScriptDeclRaw { start, end, id: id.id.to_string(), script, params: Some(params) }),
+    <start:@L> "define" "script" <id:Ident> <script:EmbeddedScript> <end:@L> => StmtRaw::ScriptDecl(ScriptDeclRaw { start, end, id: id.id.to_string(), script, params: None }),
+    
+    Const => StmtRaw::Expr(Box::new(<>)),
+    FnDecl => StmtRaw::Expr(Box::new(ExprRaw::FnDecl(<>))),
+    Intrinsic => StmtRaw::Expr(Box::new(ExprRaw::FnDecl(<>))),
+
+    //
+    // FIXME - Future, allow modular subgraphs in query language
+    //
+    // <start:@L> "create" "stream" <id:Ident> <end:@L> => StmtRaw::Stream(StreamStmtRaw { start, end, id: id.id.to_string() }),
+
+    // <start:@L> "create" "operator" <id:Ident> "from" <target:Ident> <params:WithClause> <end:@L> => StmtRaw::Operator(OperatorStmtRaw { start, end, id: id.id.to_string(), target: target.id.to_string(), params: Some(params) }),
+    // <start:@L> "create" "operator" <id:Ident> "from" <target:Ident>  <end:@L> => StmtRaw::Operator(OperatorStmtRaw { start, end, id: id.id.to_string(), target: target.id.to_string(), params: None }),
+
+    // <start:@L> "create" "operator" <id:Ident> <params:WithClause> <end:@L> => StmtRaw::Operator(OperatorStmtRaw { start, end, id: id.id.to_string(), target: id.id.to_string(), params: Some(params) }),
+    // <start:@L> "create" "operator" <id:Ident> <end:@L> => StmtRaw::Operator(OperatorStmtRaw { start, end, id: id.id.to_string(), target: id.id.to_string(), params: None }),
+
+    // <start:@L> "create" "script" <id:Ident> "from" <target:Ident> <params:WithClause> <end:@L> => StmtRaw::Script(ScriptStmtRaw { start, end, id: id.id.to_string(), target: target.id.to_string(), params: Some(params) }),
+    // <start:@L> "create" "script" <id:Ident> "from" <target:Ident> <end:@L> => StmtRaw::Script(ScriptStmtRaw { start, end, id: id.id.to_string(), target: target.id.to_string(), params: None }),
+
+    // <start:@L> "create" "script" <id:Ident> <params:WithClause> <end:@L> => StmtRaw::Script(ScriptStmtRaw { start, end, id: id.id.to_string(), target: id.id.to_string(), params: Some(params) }),
+    // <start:@L> "create" "script" <id:Ident> <end:@L> => StmtRaw::Script(ScriptStmtRaw { start, end, id: id.id.to_string(), target: id.id.to_string(), params: None }),
+
+    // <start:@L> "select" <target:ComplexExprImut> "from" <from:StreamPort> <windows:WindowClause> <maybe_where:WhereClause> <maybe_group_by:GroupByClause> "into" <into:StreamPort> <maybe_having:HavingClause> <end:@L> => StmtRaw::Select(Box::new(SelectRaw { start, end, from, into, target, maybe_where, maybe_having, windows, maybe_group_by})),
 }
 
 WindowKind: WindowKind = {
@@ -46,14 +117,30 @@ WindowKind: WindowKind = {
 }
 
 Stmt: StmtRaw<'input> = {
+    <m:ModuleStmt> => StmtRaw::ModuleStmt(m),
+
     <start:@L> "define" <kind:WindowKind> "window" <id:Ident> <params:WithScriptClause> <end:@L> => StmtRaw::WindowDecl(WindowDeclRaw { start, end, id: id.id.to_string(), kind, params: params.0, script: params.1 }),
-    <start:@L> "define" <kind:OperatorKind> "operator" <id:Ident> <params:WithClause> <end:@L> => StmtRaw::OperatorDecl(OperatorDeclRaw { start, end, kind, id: id.id.to_string(), params }),
-    <start:@L> "define" "script" <id:Ident> <params:ScriptWithClause> <script:EmbeddedScript> <end:@L> => StmtRaw::ScriptDecl(ScriptDeclRaw { start, end, id: id.id.to_string(), script, params }),
+
+    <start:@L> "define" <kind:OperatorKind> "operator" <id:Ident> <params:WithClause> <end:@L> => StmtRaw::OperatorDecl(Box::new(OperatorDeclRaw { start, end, kind, id: id.id.to_string(), params: Some(params) })),
+    <start:@L> "define" <kind:OperatorKind> "operator" <id:Ident>  <end:@L> => StmtRaw::OperatorDecl(Box::new(OperatorDeclRaw { start, end, kind, id: id.id.to_string(), params: None })),
+
+    <start:@L> "define" "script" <id:Ident> <params:ScriptWithClause> <script:EmbeddedScript> <end:@L> => StmtRaw::ScriptDecl(ScriptDeclRaw { start, end, id: id.id.to_string(), script, params: Some(params) }),
+    <start:@L> "define" "script" <id:Ident> <script:EmbeddedScript> <end:@L> => StmtRaw::ScriptDecl(ScriptDeclRaw { start, end, id: id.id.to_string(), script, params: None }),
+    
     <start:@L> "create" "stream" <id:Ident> <end:@L> => StmtRaw::Stream(StreamStmtRaw { start, end, id: id.id.to_string() }),
-    <start:@L> "create" "operator" <id:Ident> "from" <target:Ident> <params:WithClause> <end:@L> => StmtRaw::Operator(OperatorStmtRaw { start, end, id: id.id.to_string(), target: target.id.to_string(), params }),
-    <start:@L> "create" "operator" <id:Ident> <params:WithClause> <end:@L> => StmtRaw::Operator(OperatorStmtRaw { start, end, id: id.id.to_string(), target: id.id.to_string(), params }),
-    <start:@L> "create" "script" <id:Ident> "from" <target:Ident> <params:WithClause> <end:@L> => StmtRaw::Script(ScriptStmtRaw { start, end, id: id.id.to_string(), target: target.id.to_string(), params }),
-    <start:@L> "create" "script" <id:Ident> <params:WithClause> <end:@L> => StmtRaw::Script(ScriptStmtRaw { start, end, id: id.id.to_string(), target: id.id.to_string(), params }),
+
+    <start:@L> "create" "operator" <id:Ident> "from" <target:ModularTarget> <params:WithClause> <end:@L> => StmtRaw::Operator(OperatorStmtRaw { start, end, id: id.id.to_string(), module: target.0, target: target.1.id.to_string(), params: Some(params) }),
+    <start:@L> "create" "operator" <id:Ident> "from" <target:ModularTarget>  <end:@L> => StmtRaw::Operator(OperatorStmtRaw { start, end, id: id.id.to_string(), module: target.0, target: target.1.id.to_string(), params: None }),
+
+    <start:@L> "create" "operator" <id:Ident> <params:WithClause> <end:@L> => StmtRaw::Operator(OperatorStmtRaw { start, end, id: id.id.to_string(), module: vec![], target: id.id.to_string(), params: Some(params) }),
+    <start:@L> "create" "operator" <id:Ident> <end:@L> => StmtRaw::Operator(OperatorStmtRaw { start, end, id: id.id.to_string(), module: vec![], target: id.id.to_string(), params: None }),
+
+    <start:@L> "create" "script" <id:Ident> "from" <target:ModularTarget> <params:WithClause> <end:@L> => StmtRaw::Script(ScriptStmtRaw { start, end, module: vec![], id: id.id.to_string(), target: target.1.id.to_string(), params: Some(params) }),
+    <start:@L> "create" "script" <id:Ident> "from" <target:ModularTarget> <end:@L> => StmtRaw::Script(ScriptStmtRaw { start, end, id: id.id.to_string(), module: target.0, target: target.1.id.to_string(), params: None }),
+
+    <start:@L> "create" "script" <id:Ident> <params:WithClause> <end:@L> => StmtRaw::Script(ScriptStmtRaw { start, end, id: id.id.to_string(), module: vec![], target: id.id.to_string(), params: Some(params) }),
+    <start:@L> "create" "script" <id:Ident> <end:@L> => StmtRaw::Script(ScriptStmtRaw { start, end, id: id.id.to_string(), module: vec![], target: id.id.to_string(), params: None }),
+
     <start:@L> "select" <target:ComplexExprImut> "from" <from:StreamPort> <windows:WindowClause> <maybe_where:WhereClause> <maybe_group_by:GroupByClause> "into" <into:StreamPort> <maybe_having:HavingClause> <end:@L> => StmtRaw::Select(Box::new(SelectRaw { start, end, from, into, target, maybe_where, maybe_having, windows, maybe_group_by})),
 }
 
@@ -61,19 +148,26 @@ MaybePort: Option<IdentRaw<'input>> = {
     ("/" <Ident>)? => <>,
 }
 
-StreamPort: (IdentRaw<'input>, Option<IdentRaw<'input>>) = {
-    <op:Ident> <port:MaybePort> => (op, port)
+ModularTarget: (Vec<IdentRaw<'input>>, IdentRaw<'input>) = {
+    <target:Ident> => (vec![], target),
+    <m:ModPath> "::" <target:Ident> => (m, target),
 }
 
-WindowClause: Option<Vec<WindowDefnRaw>> = {
+StreamPort: (IdentRaw<'input>, Option<IdentRaw<'input>>) = {
+    <op:Ident> <port:MaybePort> => (op, port),
+    // <m:ModPath> "::" <op:Ident> <port:MaybePort> => (op, port) // FIXME future
+}
+
+WindowClause: Option<Vec<WindowDefnRaw<'input>>> = {
     (<WindowDefn>)? => <>,
 }
 
-Window: WindowDefnRaw = {
-    <start:@L> <id:Ident> <end:@L> => WindowDefnRaw { start, end, id: id.id.to_string() },
+Window: WindowDefnRaw<'input> = {
+    <start:@L> <id:Ident> <end:@L> => WindowDefnRaw { start, end, module: vec![], id: id.id.to_string() },
+    <start:@L> <module:ModPath> "::" <id:Ident> <end:@L> => WindowDefnRaw { start, end, module, id: id.id.to_string() },
 }
 
-Windows: Vec<WindowDefnRaw> = {
+Windows: Vec<WindowDefnRaw<'input>> = {
     <fields:Windows_> => {
         let mut fields = fields;
         fields.reverse();
@@ -81,12 +175,12 @@ Windows: Vec<WindowDefnRaw> = {
     },
 }
 
-Windows_: Vec<WindowDefnRaw> = {
+Windows_: Vec<WindowDefnRaw<'input>> = {
     <Sep<Windows_, Window, ",">> => <>
 }
 
 
-WindowDefn: Vec<WindowDefnRaw>  = {
+WindowDefn: Vec<WindowDefnRaw<'input>>  = {
     "[" <windows:Windows> "]" => windows
 }
 
@@ -102,13 +196,11 @@ GroupByClause: Option<GroupByRaw<'input>> = {
     ("group" "by" <GroupDef>)? => <>
 }
 
-
 GroupDef: GroupByRaw<'input> = {
     <start:@L> <expr:ExprImut> <end:@L> => GroupByRaw::Expr{start, expr, end},
     <start:@L> "set" "("<items:GroupDefs>")" <end:@L> => GroupByRaw::Set{start, items, end},
     <start:@L> "each" "("<expr:ExprImut>")" <end:@L> => GroupByRaw::Each{start, expr, end},
 }
-
 
 GroupDefs: Vec<GroupByRaw<'input>> = {
     <fields:GroupDefs_> => {
@@ -123,19 +215,23 @@ GroupDefs_: Vec<GroupByRaw<'input>> = {
 }
 
 EmbeddedScriptImut: Option<ScriptRaw<'input>> = {
-    ("script" <ExprImut>)? => Some(ScriptRaw::new(vec![ExprRaw::Imut(<>?)])),
+    ("script" <EmbeddedScriptContent>)? => <>?,
+}
+
+EmbeddedScriptContent: Option<ScriptRaw<'input>> = {
+    <ExprImut> => Some(ScriptRaw::new(vec![ExprRaw::Imut(<>)], None)),
 }
 
 WithScriptClause: (WithExprsRaw<'input>, Option<ScriptRaw<'input>>) = {
     "with" <with:WithExprs> <script:EmbeddedScriptImut> "end" => (with, script),
 }
 
-WithClause: Option<WithExprsRaw<'input>> = {
-    (<ScriptWithClause> "end")? => <>?,
+WithClause: WithExprsRaw<'input> = {
+    <ScriptWithClause> "end" => <>,
 }
 
-ScriptWithClause: Option<WithExprsRaw<'input>> = {
-    ("with" <WithExprs> )? => <>,
+ScriptWithClause: WithExprsRaw<'input> = {
+    "with" <WithExprs> => <>,
 }
 
 WithExprs: WithExprsRaw<'input> = {
@@ -159,14 +255,26 @@ OperatorKind: OperatorKindRaw = {
 }
 
 EmbeddedScript: ScriptRaw<'input> = {
-    "script" <exprs:Exprs> "end" => ScriptRaw::new(exprs),
+    "script" <exprs:Exprs> "end" => ScriptRaw::new(exprs, None),
 }
-
 
 ///////////////////////////////////////
 
 pub(crate) Script : ScriptRaw<'input> = {
-    <exprs:Exprs> "<end-of-stream>"? => ScriptRaw::new(exprs),
+  <doc:ModComment> <exprs:Exprs> "<end-of-stream>"? => ScriptRaw::new(exprs, doc),
+}
+
+ModComment: Option<Vec<Cow<'input, str>>> = {
+    (<ModComment_>)? => <>
+}
+
+ModComment_: Vec<Cow<'input, str>> = {
+    <c:"<mod-comment>"> => vec![c.into()],
+    <v:ModComment_> <c:"<mod-comment>"> => {
+        let mut v = v;
+        v.push(c.into());
+        v
+    },
 }
 
 /// List of expressions at the root of the script
@@ -182,12 +290,26 @@ Exprs: ExprsRaw<'input> = {
 MayBeConstExpr: ExprRaw<'input> = {
      Const => <>,
      FnDecl => ExprRaw::FnDecl(<>),
+     Intrinsic => ExprRaw::FnDecl(<>),
+     Module => ExprRaw::Module(<>),
      Expr => <>
 }
 
 /// A const expressions (this gets compiled out during the 2nd phjase)
 Const: ExprRaw<'input> = {
-    <start:@L> "const" <name:Ident> @L "=" @R <expr:SimpleExprImut> <end:@L> => ExprRaw::Const{name: name.id, expr: expr, start, end},
+    <comment:DocComment> <start:@L> "const" <name:Ident> @L "=" @R <expr:SimpleExprImut> <end:@L> => ExprRaw::Const{name: name.id, expr: expr, start, end, comment},
+}
+
+DocComment: Option<Vec<Cow<'input, str>>> = {
+    (<DocComment_>)? => <>
+}
+DocComment_: Vec<Cow<'input, str>> = {
+    <c:"<doc-comment>"> => vec![c.into()],
+    <v:DocComment_> <c:"<doc-comment>"> => {
+        let mut v = v;
+        v.push(c.into());
+        v
+    },
 }
 
 ////////////////////////////// Expr (mutable) //////////////////////////////
@@ -219,8 +341,13 @@ AlwaysImutExpr: ImutExprRaw<'input> = {
     <path:Path> => ImutExprRaw::Path(path),
     <record:Record> => ImutExprRaw::Record(Box::new(record)),
     <list:List> => ImutExprRaw::List(Box::new(list)),
-    <s:StringLiteral> => ImutExprRaw::String(s)
+    <s:StringLiteral> => ImutExprRaw::String(s),
+    <r:Recur> => ImutExprRaw::Recur(r),
+}
 
+Recur: RecurRaw<'input> = {
+    <start:@L> "recur" "(" ")" <end:@L> => RecurRaw{start,end, exprs: vec![]},
+    <start:@L> "recur" "(" <args:InvokeArgs> ")" <end:@L> => RecurRaw{start, end, exprs: args},
 }
 
 ////////////////////////////// Expr (immutable) ////////////////////////////////////////
@@ -333,22 +460,147 @@ ComplexExprImut: ImutExprRaw<'input> = {
     ExprImut => <>
 }
 
-FnDecl: FnDeclRaw<'input> = {
-  <start:@L> "fn" <name:Ident> "(" <args:FnArgs> ")" "with" <body:Exprs> "end" <end:@L> => FnDeclRaw{name, args, body, start, end}
-}
-
-FnArgs: Vec<IdentRaw<'input>> = {
-    <fields:FnArgs_> => {
-        let mut fields = fields;
-        fields.reverse();
-        fields
+Intrinsic: AnyFnRaw<'input> = {
+    <doc:DocComment> <start:@L> "intrinsic" "fn" <name:Ident> "("  ")" "as" <imod:Ident> "::" <ifn:Ident>  <end:@L> => {
+        let invoce_args = vec![];
+        let invoke = InvokeRaw{
+            start,
+            end,
+            module: vec!["core".into(), imod.id.to_string()],
+            fun: ifn.id.to_string(),
+            args: invoce_args
+        };
+        let body = vec![ExprRaw::Imut(ImutExprRaw::Invoke(invoke))];
+        AnyFnRaw::Normal(FnDeclRaw{name, args: vec![], body, start, end, doc, open: false, inline: true})
+    },
+    <doc:DocComment> <start:@L> "intrinsic" "fn" <name:Ident> "(" <args:FnArgs> ")" "as" <imod:Ident> "::" <ifn:Ident>  <end:@L> => {
+        let invoce_args = args.iter().map(|a|           
+            ImutExprRaw::Path(
+                PathRaw::Local(
+                    LocalPathRaw{start: a.start, end: a.end, segments: vec![SegmentRaw::from_id(a.clone())]}
+                ))).collect();
+        let invoke = InvokeRaw{
+            start,
+            end,
+            module: vec!["core".into(), imod.id.to_string()],
+            fun: ifn.id.to_string(),
+            args: invoce_args
+        };
+        let body = vec![ExprRaw::Imut(ImutExprRaw::Invoke(invoke))];
+        AnyFnRaw::Normal(FnDeclRaw{name, args, body, start, end, doc, open: false, inline: true})
+    },
+    <doc:DocComment> <start:@L> "intrinsic" "fn" <name:Ident> "(" <args:FnArgs> "," "." "." "." ")" "as" <imod:Ident> "::" <ifn:Ident>  <end:@L> => {
+        let invoce_args = args.iter().map(|a|           
+            ImutExprRaw::Path(
+                PathRaw::Local(
+                    LocalPathRaw{start: a.start, end: a.end, segments: vec![SegmentRaw::from_id(a.clone())]}
+                ))).collect();
+        let invoke = InvokeRaw{
+            start,
+            end,
+            module: vec!["core".into(), imod.id.to_string()],
+            fun: ifn.id.to_string(),
+            args: invoce_args
+        };
+        let body = vec![ExprRaw::Imut(ImutExprRaw::Invoke(invoke))];
+        AnyFnRaw::Normal(FnDeclRaw{name, args, body, start, end, doc, open: true, inline: true})
+    },
+    <doc:DocComment> <start:@L> "intrinsic" "fn" <name:Ident> "(" "." "." "." ")" "as" <imod:Ident> "::" <ifn:Ident>  <end:@L> => {
+        let args = vec![];
+        let invoce_args = vec![];
+        let invoke = InvokeRaw{
+            start,
+            end,
+            module: vec!["core".into(), imod.id.to_string()],
+            fun: ifn.id.to_string(),
+            args: invoce_args
+        };
+        let body = vec![ExprRaw::Imut(ImutExprRaw::Invoke(invoke))];
+        AnyFnRaw::Normal(FnDeclRaw{name, args, body, start, end, doc, open: true, inline: true})
     },
 }
 
-FnArgs_: Vec<IdentRaw<'input>> = {
-    <Sep<FnArgs_, Ident, ",">> => <>
+Module: ModuleRaw<'input> = {
+    <start:@L> "mod" <name:Ident> "with" <doc:ModComment> <exprs:ModuleExprs> "end" <end:@L> => ModuleRaw{name, start, end, exprs, doc: doc},
 }
 
+/// List of expressions at the root of the script
+ModuleExprs: ExprsRaw<'input> = {
+    <expr:ModuleExpr> ";" <list:ModuleExprs> => {
+       let mut list = list;
+       list.insert(0,expr);
+       list
+    },
+    <item:ModuleExpr> ";"? => vec![item],
+}
+
+ModuleExpr: ExprRaw<'input> = {
+    Const => <>,
+    FnDecl => ExprRaw::FnDecl(<>),
+    Intrinsic => ExprRaw::FnDecl(<>),
+    Module => ExprRaw::Module(<>),
+}
+
+FnDecl: AnyFnRaw<'input> = {
+  <doc:DocComment> <start:@L> "fn" <name:Ident> "(" "." "." "." ")" "with" <body:Exprs> "end" <end:@L> => AnyFnRaw::Normal(FnDeclRaw{name, args: vec![], body, start, end, doc, open: true, inline: false}),
+  <doc:DocComment> <start:@L> "fn" <name:Ident> "(" <args:FnArgs>  "," "." "." "." ")" "with" <body:Exprs> "end" <end:@L> => AnyFnRaw::Normal(FnDeclRaw{name, args, body, start, end, doc, open: true, inline: false}),
+
+  <doc:DocComment> <start:@L> "fn" <name:Ident> "("  ")" "with" <body:Exprs> "end" <end:@L> => AnyFnRaw::Normal(FnDeclRaw{name, args: vec![], body, start, end, doc, open: false, inline: false}),
+  <doc:DocComment> <start:@L> "fn" <name:Ident> "(" <args:FnArgs> ")" "with" <body:Exprs> "end" <end:@L> => AnyFnRaw::Normal(FnDeclRaw{name, args, body, start, end, doc, open: false, inline: false}),
+  
+  <doc:DocComment> <start:@L> "fn" <name:Ident> "("  ")" "of" <cases:FnCases> "end" <end:@L> => AnyFnRaw::Match(MatchFnDeclRaw{name, args: vec![], start, end, cases, doc, open: false, inline: false}),
+  <doc:DocComment> <start:@L> "fn" <name:Ident> "(" <args:FnArgs> ")" "of" <cases:FnCases> "end" <end:@L> => AnyFnRaw::Match(MatchFnDeclRaw{name, args, start, end, cases, doc, open: false, inline: false}),
+}
+
+FnCases: Vec<PredicateClauseRaw<'input>> = {
+    <cases:FnCaseClauses> <default:FnCaseDefault> => {
+        let mut cases = cases;
+        cases.push(default);
+        cases
+    },
+    <start:@L> <default:FnCaseDefault> => {
+        let mut cases = Vec::new();
+        cases.push(default);
+        cases
+    }
+}
+
+FnCaseDefault: PredicateClauseRaw<'input> = {
+    <start:@L> "default" <exprs:Effectors> <end:@L> => {
+        PredicateClauseRaw { pattern: PatternRaw::Default, exprs, guard: None, start, end}
+    }
+}
+
+FnCase: PredicateClauseRaw<'input> = {
+    <start:@L> "case" <pstart:@L> "(" <pattern:ArrayPredicatePatterns>  ")" <guard:WhenClause> <pend:@L> <exprs:Effectors> <end:@L> => PredicateClauseRaw {
+        pattern: PatternRaw::Assign(AssignPatternRaw {
+            id: FN_RES_NAME.into(),
+            pattern: Box::new(PatternRaw::Tuple(TuplePatternRaw{exprs: pattern, start: pstart, end: pend, open: false}))
+        }),
+        exprs,
+        guard,
+        start,
+        end
+    },
+}
+
+FnCaseClauses: Vec<PredicateClauseRaw<'input>> = {
+    <e:FnCase> => vec![e],
+    <v:FnCaseClauses> <e:FnCase> => {
+        let mut v = v;
+        v.push(e);
+        v
+    },
+}
+
+FnArgs: Vec<IdentRaw<'input>> = {
+    <e:Ident> => vec![e],
+    <v:FnArgs> "," <e:Ident> => {
+        let mut v = v;
+        v.push(e);
+        v
+    },
+}
 
 SimpleExprImut: ImutExprRaw<'input> = {
     "(" <expr:ComplexExprImut> ")" => expr,
@@ -431,6 +683,7 @@ StrLitElements: StrLitElements<'input> = {
 StringPart: Cow<'input, str> = {
     "string" => <>
 }
+
 /// array semi literals
 List: ListRaw<'input> = {
     <start:@L> "[" <exprs:ListElements> "]" <end:@L> => ListRaw{start, end, exprs},
@@ -472,6 +725,7 @@ Path: PathRaw<'input> = {
     EventPath => <>,
     StatePath => <>,
     LocalPath => <>,
+    ConstPath => <>,
     AggrPath => <>,
     ArgsPath => <>,
 }
@@ -528,6 +782,19 @@ LocalPath: PathRaw<'input> = {
     },
 }
 
+/// Local path
+ConstPath: PathRaw<'input> = {
+    <start:@L> <module:ModPath> "::" <path:LocalPath> <end:@L> => {
+        if let PathRaw::Local(LocalPathRaw { segments, .. }) = path {
+
+            PathRaw::Const(ConstPathRaw { module, segments, start, end })
+        } else {
+            unreachable!()
+        }
+    },
+}
+
+
 /// State path
 StatePath: PathRaw<'input> = {
     <start:@L> "state" <segments:PathSegments> <end:@L> => PathRaw::State(StatePathRaw { segments, start, end }),
@@ -561,11 +828,10 @@ PathSegment: SegmentRaw<'input> = {
     <id:Ident> => SegmentRaw::from_id(id),
 }
 
-
 /// A path selector aka [...]
 Selector: SegmentRaw<'input> = {
-    <start_lower:@L> <range_start:ComplexExprImut> <end_lower:@L> ":" <start_upper:@L> <range_end:ComplexExprImut> <end_upper:@L> => SegmentRaw::Range{range_start, range_end, start_lower, end_lower, start_upper, end_upper},
-    <start:@L> <expr:ComplexExprImut> <end:@L>  => SegmentRaw::Element{expr, start, end},
+    <start_lower:@L> <range_start:ComplexExprImut> <end_lower:@L> ":" <start_upper:@L> <range_end:ComplexExprImut> <end_upper:@L> => SegmentRaw::Range(Box::new(SegmentRangeRaw{range_start, range_end, start_lower, end_lower, start_upper, end_upper})),
+    <start:@L> <expr:ComplexExprImut> <end:@L>  => SegmentRaw::Element(Box::new(SegmentElementRaw{expr, start, end})),
 }
 
 
@@ -575,8 +841,23 @@ Selector: SegmentRaw<'input> = {
 
 /// Function invocation
 Invoke: InvokeRaw<'input> = {
-    <start:@L> <module:Ident> "::" <fun:Ident> "(" <args:InvokeArgs> ")" <end:@L> => InvokeRaw { module: module.id.to_string(), fun: fun.id.to_string(), args, start, end },
-    <start:@L> <module:Ident> "::" <fun:Ident> "(" ")" <end:@L> => InvokeRaw { module: module.id.to_string(), fun: fun.id.to_string(), args: vec![], start, end },
+    <start:@L> <fun:FunctionName> "(" <args:InvokeArgs> ")" <end:@L> => InvokeRaw { module: fun.0, fun: fun.1, args, start, end },
+    <start:@L> <fun:FunctionName> "(" ")" <end:@L> => InvokeRaw { module: fun.0, fun: fun.1, args: vec![], start, end },
+}
+
+FunctionName: (Vec<String>, String) = {
+    <fun:Ident> => (vec![], fun.id.to_string()),
+    <p:ModPath> "::" <fun:Ident> => (p.iter().map(|i| i.id.to_string()).collect(), fun.id.to_string()),
+}
+
+
+ModPath: Vec<IdentRaw<'input>> = {
+    <v:ModPath> "::" <e:Ident> => {
+        let mut v = v;
+        v.push(e);
+        v
+    },
+    <e:Ident> => vec![e],
 }
 
 InvokeArgs: ImutExprsRaw<'input> = {
@@ -607,25 +888,13 @@ Emit: ExprRaw<'input> = {
     <start:@L> "emit" <end:@L> => ExprRaw::Emit(Box::new(EmitExprRaw { expr: ImutExprRaw::Path(PathRaw::Event(EventPathRaw { segments: vec![], start, end })).into(), start, end, port: None })),
 }
 
-
 ////////////////////////////// Let expression  //////////////////////////////
 // An expression that assigns a value to a variable
 
 /// Let expression to assign values
 Let: ExprRaw<'input> = {
-// TODO FIXME investigate multi-let after `event` keyword +change
-//    <start:@L> "let" <exprs:Assignments> <end:@L> "end" => Expr::Let(Let { exprs, start, end }),
     <start:@L> "let" <expr:Assignment> <end:@L> => expr, // Expr::Let(Let { exprs: vec![expr], start, end }),
 }
-
-// Assignments: Exprs = {
-//     <list:Assignments> "," <expr:Assignment> => {
-//         let mut list = list;
-//         list.push(expr);
-//         list
-//     },
-//     Assignment => vec![<>],
-// }
 
 Assignment: ExprRaw<'input> = {
     <start:@L> <path:Path> @L "=" @R <expr:SimpleExpr> <end:@L> => ExprRaw::Assign(Box::new(AssignRaw { path, expr: expr, start, end })),
@@ -659,11 +928,9 @@ PatchOperationClause: PatchOperationRaw<'input> = {
     "erase" <ident:PatchField> => PatchOperationRaw::Erase{ ident },
     "move" <from:PatchField> "=>" <to:PatchField>  => PatchOperationRaw::Move{ from, to },
     "copy" <from:PatchField> "=>" <to:PatchField>  => PatchOperationRaw::Copy{ from, to },
-    // "test" <ident:Ident> "=>" <expr:Expr> => PatchOperationClause { kind: PatchOperationKind::Add, ident, Some(expr) },
     "merge" <ident:PatchField> "=>" <expr:ComplexExprImut> => PatchOperationRaw::Merge { ident, expr },
     "merge" "=>" <expr:ComplexExprImut> => PatchOperationRaw::TupleMerge { expr },
 }
-
 
 ////////////////////////////// merge expression  //////////////////////////////
 // Merges a perge spec (record) into the target
@@ -690,7 +957,6 @@ ForCaseClauses: ComprehensionCasesRaw<'input> = {
 
 ForCaseClause: ComprehensionCaseRaw<'input> = {
     "case" <start:@L>  "(" <k:Ident> "," <v:Ident> ")" <end:@L> <guard:WhenClause> <exprs:Effectors>  => ComprehensionCaseRaw { key_name: k.id, value_name: v.id, exprs, guard, start, end },
-    "case" <start:@L> "(" <k:Ident> "," <v:Ident> ")" <end:@L> <exprs:Effectors> => ComprehensionCaseRaw { key_name: k.id, value_name: v.id, exprs, guard: None, start, end },
 }
 
 // ////////////////////////////// for comprehension (imutmut)  //////////////////////////////
@@ -711,7 +977,6 @@ ForCaseClausesImut: ImutComprehensionCasesRaw<'input> = {
 
 ForCaseClauseImut: ImutComprehensionCaseRaw<'input> = {
     "case" <start:@L>  "(" <k:Ident> "," <v:Ident> ")" <end:@L> <guard:WhenClause> <exprs:EffectorsImut>  => ImutComprehensionCaseRaw { key_name: k.id, value_name: v.id, exprs, guard, start, end },
-    "case" <start:@L> "(" <k:Ident> "," <v:Ident> ")" <end:@L> <exprs:EffectorsImut> => ImutComprehensionCaseRaw { key_name: k.id, value_name: v.id, exprs, guard: None, start, end },
 }
 
 ////////////////////////////// match expression (mutating)  //////////////////////////////
@@ -734,12 +999,11 @@ Predicates: PredicatesRaw<'input> = {
 
 /// A case statement 
 PredicateClause: PredicateClauseRaw<'input> = {
-    <start:@L> "case" <rp:RecordCaseClause> <exprs:Effectors> <end:@L> => PredicateClauseRaw { pattern: rp, exprs, guard: None, start, end },
     <start:@L> "case" <rp:RecordCaseClause> <guard:WhenClause> <exprs:Effectors> <end:@L> => PredicateClauseRaw { pattern: rp, exprs, guard, start, end },
-    <start:@L> "case" <ap:ArrayCaseClause> <exprs:Effectors> <end:@L> => PredicateClauseRaw { pattern: ap, exprs, guard: None, start, end },
     <start:@L> "case" <ap:ArrayCaseClause> <guard:WhenClause> <exprs:Effectors> <end:@L> => PredicateClauseRaw { pattern: ap, exprs, guard, start, end },
-    <start:@L> "case" <lhs:ExprCaseClause> <rhs:Effectors> <end:@L> => PredicateClauseRaw { pattern: lhs, exprs: rhs, guard: None, start, end },
+    <start:@L> "case" <tp:TupleCaseClause> <guard:WhenClause> <exprs:Effectors> <end:@L> => PredicateClauseRaw { pattern: tp, exprs, guard, start, end },
     <start:@L> "case" <lhs:ExprCaseClause> <guard:WhenClause> <rhs:Effectors> <end:@L> => PredicateClauseRaw { pattern: lhs, exprs: rhs, guard, start, end},
+    <start:@L> "case" "_" <guard:WhenClause> <rhs:Effectors> <end:@L> => PredicateClauseRaw { pattern: PatternRaw::DoNotCare, exprs: rhs, guard, start, end},
     <start:@L> "default" <exprs:Effectors> <end:@L> => PredicateClauseRaw { pattern: PatternRaw::Default, exprs, guard: None, start, end },
 }
 
@@ -778,11 +1042,9 @@ PredicatesImut: ImutPredicatesRaw<'input> = {
 
 /// A case statement 
 PredicateClauseImut: ImutPredicateClauseRaw<'input> = {
-    <start:@L> "case" <rp:RecordCaseClause> <exprs:EffectorsImut> <end:@L> => ImutPredicateClauseRaw { pattern: rp, exprs, guard: None, start, end },
     <start:@L> "case" <rp:RecordCaseClause> <guard:WhenClause> <exprs:EffectorsImut> <end:@L> => ImutPredicateClauseRaw { pattern: rp, exprs, guard, start, end },
-    <start:@L> "case" <ap:ArrayCaseClause> <exprs:EffectorsImut> <end:@L> => ImutPredicateClauseRaw { pattern: ap, exprs, guard: None, start, end },
     <start:@L> "case" <ap:ArrayCaseClause> <guard:WhenClause> <exprs:EffectorsImut> <end:@L> => ImutPredicateClauseRaw { pattern: ap, exprs, guard, start, end },
-    <start:@L> "case" <lhs:ExprCaseClause> <rhs:EffectorsImut> <end:@L> => ImutPredicateClauseRaw { pattern: lhs, exprs: rhs, guard: None, start, end },
+    <start:@L> "case" <tp:TupleCaseClause> <guard:WhenClause> <exprs:EffectorsImut> <end:@L> => ImutPredicateClauseRaw { pattern: tp, exprs, guard, start, end },
     <start:@L> "case" <lhs:ExprCaseClause> <guard:WhenClause> <rhs:EffectorsImut> <end:@L> => ImutPredicateClauseRaw { pattern: lhs, exprs: rhs, guard, start, end},
     <start:@L> "default" <exprs:EffectorsImut> <end:@L> => ImutPredicateClauseRaw { pattern: PatternRaw::Default, exprs, guard: None, start, end },
 }
@@ -817,6 +1079,12 @@ ArrayCaseClause: PatternRaw<'input> = {
     <ap:ArrayPattern> => PatternRaw::Array(ap),
 }
 
+/// A array pattern aka [name = ] %[...]
+TupleCaseClause: PatternRaw<'input> = {
+    <start:@L> <segment:Ident> "=" <tp:TuplePattern> <end:@L> => PatternRaw::Assign(AssignPatternRaw { id:segment.id, pattern: Box::new(PatternRaw::Tuple(tp)) }),
+    <tp:TuplePattern> => PatternRaw::Tuple(tp),
+}
+
 /// An expression clause aka [name = ] <expr>
 ExprCaseClause: PatternRaw<'input> = {
     <start:@L> <segment:Ident> "=" <expr:ComplexExprImut> <end:@L> => PatternRaw::Assign(AssignPatternRaw { id:  segment.id, pattern: Box::new(PatternRaw::Expr(expr)) }),
@@ -825,9 +1093,8 @@ ExprCaseClause: PatternRaw<'input> = {
 
 /// When part of an expression (when ...)
 WhenClause: Option<ImutExprRaw<'input>> = {
-    "when" <expr:ComplexExprImut> => Some(expr),
+    ("when" <ComplexExprImut>)? => <>,
 }
-
 
 /// Predicate Patterns (aka tests) for record pattrens
 PredicateFieldPattern: PredicatePatternRaw<'input> = {
@@ -838,12 +1105,11 @@ PredicateFieldPattern: PredicatePatternRaw<'input> = {
     <start:@L> <lhs:Ident> <op:"~="> <ap:ArrayPattern> <end:@L> => PredicatePatternRaw::ArrayPatternEq { lhs: lhs.id, pattern: ap },
     <start:@L> "present" <lhs:Ident> <end:@L> => PredicatePatternRaw::FieldPresent { lhs: lhs.id },
     <start:@L> "absent" <lhs:Ident> <end:@L> => PredicatePatternRaw::FieldAbsent { lhs: lhs.id },
-    <lhs:Ident> <op:"=="> <expr:ComplexExprImut> => PredicatePatternRaw::Eq { lhs: lhs.id, rhs: expr, not: false },
-    <lhs:Ident> <op:"!="> <expr:ComplexExprImut> => PredicatePatternRaw::Eq { lhs: lhs.id, rhs: expr, not: true },
+    <lhs:Ident> <kind:BinCmpEq> <expr:ComplexExprImut> => PredicatePatternRaw::Bin { lhs: lhs.id, rhs: expr, kind },
 }
 
 TestExpr: TestExprRaw = {
-    <start:@L> <id:Ident> <tl: TestLiteral> <end:@L> => {
+    <start:@L> <id:Ident> <tl:TestLiteral> <end:@L> => {
         TestExprRaw { id: id.id.to_string(), test: tl, start, end}
     },
 }
@@ -856,6 +1122,30 @@ RecordPattern: RecordPatternRaw<'input> = {
 ArrayPattern: ArrayPatternRaw<'input> = {
     <start:@L> "%[" <exprs:ArrayPredicatePatterns> "]" <end:@L> => ArrayPatternRaw { exprs, start, end },
     <start:@L> "%[" "]" <end:@L> => ArrayPatternRaw { exprs: vec![], start, end },
+}
+
+TuplePattern: TuplePatternRaw<'input> = {
+    <start:@L> "%(" <exprs:TuplePredicatePatterns> <open:OpenTuple> ")" <end:@L> => TuplePatternRaw { exprs, start, end, open },
+    <start:@L> "%(" ")" <end:@L> => TuplePatternRaw { exprs: vec![], start, end, open: false },
+    <start:@L> "%(" "." "." "." ")" <end:@L> => TuplePatternRaw { exprs: vec![], start, end, open: true },
+}
+
+OpenTuple: bool = {
+    ("," "." "." ".")? => <>.is_some()
+}
+
+TuplePredicatePatterns: ArrayPredicatePatternsRaw<'input> = {
+    <list:TuplePredicatePatterns> "," <item:TuplePredicatePattern> => {
+        let mut list = list;
+        list.push(item);
+        list
+    },
+    TuplePredicatePattern => vec![<>],
+}
+
+TuplePredicatePattern: ArrayPredicatePatternRaw<'input> = {
+    ArrayPredicatePattern => <>,
+    "_" => ArrayPredicatePatternRaw::Ignore,
 }
 
 ArrayPredicatePattern: ArrayPredicatePatternRaw<'input> = {
@@ -872,7 +1162,6 @@ ArrayPredicatePatterns: ArrayPredicatePatternsRaw<'input> = {
     },
     ArrayPredicatePattern => vec![<>],
 }
-
 
 PatternFields: PatternFieldsRaw<'input> = {
     <fields:PatternFields_> => {
@@ -907,7 +1196,7 @@ Ident: IdentRaw<'input> = {
 
 #[inline]
 TestLiteral: String = {
-    "test" => <>.join(""),
+    "<extractor>" => <>.join(""),
 }
 
 Sep<L, T, D>: L = {
@@ -929,6 +1218,12 @@ BinOp<Op, Current, Next>: ImutExprRaw<'input> = {
         start,
         end,
     })),
+}
+
+
+BinCmpEq: BinOpKind = {
+    BinEq => <>,
+    BinCmp => <>
 }
 
 BinOr: BinOpKind = {
@@ -977,6 +1272,7 @@ extern {
     type Location = Location;
     type Error = crate::errors::Error;
     enum Token<'input> {
+        "<mod-comment>" => Token::ModComment(<&'input str>),
         "<doc-comment>" => Token::DocComment(<&'input str>),
         "<single-line-comment>" => Token::SingleLineComment(<&'input str>),
         "let" => Token::Let,
@@ -1008,6 +1304,8 @@ extern {
         "present" => Token::Present,
         "absent" => Token::Absent,
         "fn" => Token::Fun,
+        "intrinsic" => Token::Intrinsic,
+        "mod" => Token::Module,
         "." => Token::Dot,
         "\"" => Token::DQuote,
         ";" => Token::Semi,
@@ -1015,7 +1313,7 @@ extern {
         ":" => Token::Colon,
         "," => Token::Comma,
         "=" => Token::Eq,
-//        "_" => Token::DontCare,
+        "_" => Token::DontCare,
         "==" => Token::EqEq,
         "!=" => Token::NotEq,
         "{" => Token::LBrace,
@@ -1042,6 +1340,7 @@ extern {
         "-" => Token::Sub,
         "*" => Token::Mul,
         "/" => Token::Div,
+        "%(" => Token::LPatParen,
         "%[" => Token::LPatBracket,
         "%{" => Token::LPatBrace,
         "%" => Token::Mod,
@@ -1052,10 +1351,11 @@ extern {
         "float" => Token::FloatLiteral(<f64>, <String>),
         "string" => Token::StringLiteral(<Cow<'input, str>>),
         "heredoc" => Token::HereDoc(_, <Vec<String>>),
-        "test" => Token::TestLiteral(_, <Vec<String>>),
+        "<extractor>" => Token::TestLiteral(_, <Vec<String>>),
         "<ident>" => Token::Ident(<Cow<'input, str>>, <bool>),
         "<error>" => Token::Bad(<String>),
         "<end-of-stream>" => Token::EndOfStream,
+        
 
         "select" => Token::Select,
         "from" => Token::From,
@@ -1074,9 +1374,14 @@ extern {
         "by" => Token::By,
         "define" => Token::Define,
         "args" => Token::Args,
+        "recur" => Token::Recur,
 
         "set" => Token::Set,
         "each" => Token::Each,
+        "use" => Token::Use,
+        "as" => Token::As,
+
+        "#!config" => Token::ConfigDirective,
     }
 }
 

@@ -14,8 +14,8 @@
 
 use crate::registry::Registry;
 use crate::tremor_const_fn;
+use simd_json::prelude::*;
 use simd_json::value::borrowed::Object;
-
 pub fn load(registry: &mut Registry) {
     registry
         .insert(tremor_const_fn! (record::len(_context, _input: Object) {
@@ -30,17 +30,17 @@ pub fn load(registry: &mut Registry) {
             }),
         )
         .insert(tremor_const_fn! (record::keys(_context, _input: Object) {
-            Ok(Value::Array(_input.keys().map(|k| Value::from(k.to_string())).collect()))
+            Ok(Value::from(_input.keys().map(|k| Value::from(k.to_string())).collect::<Vec<_>>()))
         }))
         .insert(tremor_const_fn! (record::values(_context, _input: Object) {
-            Ok(Value::Array(_input.values().cloned().map(Value::from).collect()))
+            Ok(Value::from(_input.values().cloned().map(Value::from).collect::<Vec<_>>()))
 
         }))
         .insert(tremor_const_fn! (record::to_array(_context, _input: Object) {
-            Ok(Value::Array(
+            Ok(Value::from(
                 _input.iter()
-                    .map(|(k, v)| Value::Array(vec![Value::from(k.clone()), v.clone()]))
-                    .collect(),
+                    .map(|(k, v)| Value::from(vec![Value::from(k.clone()), v.clone()]))
+                    .collect::<Vec<_>>(),
             ))
         }))
         .insert(tremor_const_fn! (record::from_array(_context, _input: Array) {
@@ -50,8 +50,7 @@ pub fn load(registry: &mut Registry) {
                 let mut a = a.clone(); // TODO: this is silly.
                 //ALLOW: We know this has an element
                 let second = a.pop().unwrap();
-                //ALLOW: We know this has an element
-                if let Value::String(first) = a.pop().unwrap() {
+                if let Some(Value::String(first)) = a.pop() {
                     Ok((first, second))
                 } else {
                     Err(to_runtime_error(format!("The first element of the tuple needs to be a string: {:?}", a)))
@@ -63,13 +62,11 @@ pub fn load(registry: &mut Registry) {
         }).collect();
         Ok(Value::from(r?))
         })).insert(tremor_const_fn!(record::select(_context, _input: Object, _keys: Array) {
-        let keys: Vec<_> = _keys.iter().filter_map(|k| match k {
-            Value::String(s) => Some(s.clone()),
-            _ => None
-        }).collect();
+        let keys: Vec<_> = _keys.iter().filter_map(ValueTrait::as_str).collect();
         let r: Object =_input.iter().filter_map(|(k, v)| {
+            let k: &str = &k;
             if keys.contains(&k) {
-                Some((k.clone(), v.clone()))
+                Some((k.to_string().into(), v.clone()))
             } else {
                 None
             }
@@ -92,11 +89,6 @@ mod test {
     use crate::registry::fun;
     use halfbrown::hashmap;
     use simd_json::BorrowedValue as Value;
-    macro_rules! assert_val {
-        ($e:expr, $r:expr) => {
-            assert_eq!($e, Ok(Value::from($r)))
-        };
-    }
 
     #[test]
     fn len() {
@@ -146,10 +138,7 @@ mod test {
             "this".into() => Value::from("is"),
             "a".into() => Value::from("test")
         });
-        assert_val!(
-            f(&[&v]),
-            Value::Array(vec![Value::from("this"), Value::from("a"),])
-        );
+        assert_val!(f(&[&v]), Value::from(vec!["this", "a"]));
     }
     #[test]
     fn values() {
@@ -158,10 +147,7 @@ mod test {
             "this".into() => Value::from("is"),
             "a".into() => Value::from("test")
         });
-        assert_val!(
-            f(&[&v]),
-            Value::Array(vec![Value::from("is"), Value::from("test")])
-        );
+        assert_val!(f(&[&v]), Value::from(vec!["is", "test"]));
     }
 
     #[test]
@@ -173,20 +159,14 @@ mod test {
         });
         assert_val!(
             f(&[&v]),
-            Value::Array(vec![
-                Value::Array(vec![Value::from("this"), Value::from("is")]),
-                Value::Array(vec![Value::from("a"), Value::from("test")])
-            ])
+            Value::from(vec![vec!["this", "is"], vec!["a", "test"]])
         );
     }
 
     #[test]
     fn from_array() {
         let f = fun("record", "from_array");
-        let v = Value::Array(vec![
-            Value::Array(vec![Value::from("this"), Value::from("is")]),
-            Value::Array(vec![Value::from("a"), Value::from("test")]),
-        ]);
+        let v = Value::from(vec![vec!["this", "is"], vec!["a", "test"]]);
         assert_val!(
             f(&[&v]),
             Value::from(hashmap! {
@@ -203,7 +183,7 @@ mod test {
             "this".into() => Value::from("is"),
             "a".into() => Value::from("test")
         });
-        let v2 = Value::Array(vec![Value::from("this"), Value::from("is")]);
+        let v2 = Value::from(vec!["this", "is"]);
         assert_val!(
             f(&[&v1, &v2]),
             Value::from(hashmap! {

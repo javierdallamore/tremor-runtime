@@ -19,6 +19,8 @@ use std::io::prelude::*;
 use tremor_pipeline::FN_REGISTRY;
 use tremor_runtime;
 use tremor_runtime::errors::*;
+use tremor_script::errors::CompilerError;
+use tremor_script::path::ModulePath;
 use tremor_script::utils::*;
 use tremor_script::{AggrType, EventContext, Return, Script};
 
@@ -29,6 +31,7 @@ macro_rules! test_cases {
             fn $file() -> Result<()> {
 
                 tremor_runtime::functions::load()?;
+                let script_dir = concat!("tests/scripts/", stringify!($file), "/").to_string();
                 let script_file = concat!("tests/scripts/", stringify!($file), "/script.tremor");
                 let in_file = concat!("tests/scripts/", stringify!($file), "/in.xz");
                 let out_file = concat!("tests/scripts/", stringify!($file), "/out.xz");
@@ -37,7 +40,9 @@ macro_rules! test_cases {
                 let mut file = File::open(script_file)?;
                 let mut contents = String::new();
                 file.read_to_string(&mut contents)?;
-                let script = Script::parse(&contents, &*FN_REGISTRY.lock()?)?;
+                let contents2 = contents.clone();
+
+                let script = Script::parse(&ModulePath { mounts: vec![script_dir, "tremor-script/lib".to_string()] }, script_file, contents2, &*FN_REGISTRY.lock()?).map_err(CompilerError::error)?;
 
                 println!("Loading input: {}", in_file);
                 let in_json = load_event_file(in_file)?;
@@ -125,6 +130,31 @@ test_cases!(
     subslice,
     subslice_repeated,
     unary,
+    // preprocessor
+    pp_nest0,
+    pp_nest1,
+    pp_inline_nest1,
+    pp_nest2,
+    pp_nest3,
+    pp_alias0,
+    pp_alias1,
+    pp_alias2,
+    pp_alias3,
     // regression
     empty_array_pattern,
+    // TODO
+    // const_in_const_lookup,
+    //INSERT
+    tuple_pattern,
+    pattern_cmp,
+    pass_args,
+    escape_in_extractor,
+    const_of_const,
+    fn_extractors,
+    mod_access_const,
+    module,
+    fn_fib,
+    fn_nest2_fib,
+    fn_nest2_abs_fib,
+    pp_fn_fib,
 );

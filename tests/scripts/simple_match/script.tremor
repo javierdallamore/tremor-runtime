@@ -1,3 +1,4 @@
+use std::string;
 let $snot = "badger";
 match event of
   case rp = %{ meta ~= re|bad(?P<snot>.*)|, `event` != null } => rp.meta

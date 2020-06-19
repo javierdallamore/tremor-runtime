@@ -15,7 +15,6 @@
 
 use crate::registry::Registry;
 use crate::{tremor_const_fn, utils::sorsorted_serialize};
-use jumphash;
 use simd_json::prelude::*;
 
 pub fn load(registry: &mut Registry) {
@@ -50,11 +49,6 @@ pub fn load(registry: &mut Registry) {
 mod test {
     use crate::registry::fun;
     use simd_json::{json, BorrowedValue as Value};
-    macro_rules! assert_val {
-        ($e:expr, $r:expr) => {
-            assert_eq!($e, Ok(Value::from($r)))
-        };
-    }
 
     #[test]
     fn sorted_serialize() {

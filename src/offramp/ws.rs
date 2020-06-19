@@ -17,7 +17,6 @@ use async_std::sync::{channel, Receiver, Sender};
 use async_tungstenite::async_std::connect_async;
 use futures::SinkExt;
 use halfbrown::HashMap;
-use serde_yaml;
 use std::time::Duration;
 use tungstenite::protocol::Message;
 use url::Url;
@@ -59,7 +58,7 @@ async fn ws_loop(url: String, offramp_tx: Sender<Option<WsAddr>>) {
         let (tx, rx) = channel(64);
         offramp_tx.send(Some(tx)).await;
 
-        while let Some(msg) = rx.recv().await {
+        while let Ok(msg) = rx.recv().await {
             let r = match msg {
                 WsMessage::Text(t) => ws_stream.send(Message::Text(t)).await,
                 WsMessage::Binary(t) => ws_stream.send(Message::Binary(t)).await,

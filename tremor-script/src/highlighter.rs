@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use crate::ast::Warning;
-use crate::errors::{Error as ScriptError, *};
+use crate::errors::{CompilerError, Error as ScriptError};
 use crate::lexer::{Token, TokenSpan};
-use crate::pos::*;
+use crate::pos::Location;
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 use std::io::Write;
 use termcolor::{Buffer, BufferWriter, Color, ColorChoice, ColorSpec, WriteColor};
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 /// Error Level
 pub enum ErrorLevel {
     /// Error
@@ -41,7 +41,7 @@ impl ErrorLevel {
     }
 }
 /// Error to be highlighted
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Error {
     start: Location,
     end: Location,
@@ -100,6 +100,23 @@ impl From<&ScriptError> for Error {
     }
 }
 
+impl From<&CompilerError> for Error {
+    fn from(error: &CompilerError) -> Self {
+        let error = &error.error;
+        let (start, end) = match error.context() {
+            (_, Some(inner)) => (inner.0, inner.1),
+            _ => (Location::default(), Location::default()),
+        };
+        Self {
+            start,
+            end,
+            callout: format!("{}", error),
+            hint: error.hint(),
+            level: ErrorLevel::Error,
+            token: error.token(),
+        }
+    }
+}
 impl From<&Warning> for Error {
     fn from(warning: &Warning) -> Self {
         Self {
@@ -136,29 +153,33 @@ pub trait Highlighter {
     /// highlights a token stream
     fn highlight(
         &mut self,
-        tokens: Vec<Result<TokenSpan>>,
+        file: Option<&str>,
+        tokens: &[TokenSpan],
     ) -> std::result::Result<(), std::io::Error> {
-        self.highlight_errors(tokens, None)?;
+        self.highlight_errors2(file, &tokens.iter().collect::<Vec<_>>(), None)?;
         self.finalize()
     }
 
     /// highlights a runtime error
     fn highlight_runtime_error(
         &mut self,
-        tokens: Vec<Result<TokenSpan>>,
+        file: Option<&str>,
+        tokens: &[TokenSpan],
         expr_start: Location,
         expr_end: Location,
         error: Option<Error>,
     ) -> std::result::Result<(), std::io::Error> {
         let extracted = extract(tokens, expr_start, expr_end);
-        self.highlight_errors(extracted, error)
+        //self.highlight_errors(&extracted, error)
+        self.highlight_errors2(file, &extracted, error)
     }
 
     /// highlights compile time errors
     #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
-    fn highlight_errors(
+    fn highlight_errors2(
         &mut self,
-        tokens: Vec<Result<TokenSpan>>,
+        file: Option<&str>,
+        tokens: &[&TokenSpan],
         error: Option<Error>,
     ) -> std::result::Result<(), std::io::Error> {
         let mut printed_error = false;
@@ -166,8 +187,21 @@ pub trait Highlighter {
         match error {
             Some(Error {
                 level: ErrorLevel::Error,
+                start,
                 ..
-            }) => writeln!(self.get_writer(), "Error: ")?,
+            }) => {
+                if let Some(file) = file {
+                    writeln!(
+                        self.get_writer(),
+                        "Error in {}:{}:{} ",
+                        file,
+                        start.line,
+                        start.column
+                    )?
+                } else {
+                    writeln!(self.get_writer(), "Error: ")?
+                }
+            }
             Some(Error {
                 level: ErrorLevel::Warning,
                 ..
@@ -179,138 +213,141 @@ pub trait Highlighter {
             _ => (),
         }
         for t in tokens {
-            if let Ok(t) = t {
-                if t.span.start().line != line {
-                    line = t.span.start().line;
-                    if let Some(Error {
-                        start,
-                        end,
-                        callout,
-                        hint,
-                        level,
-                        token,
-                    }) = &error
-                    {
-                        if end.line == line - 1 {
-                            printed_error = true;
-                            // FIXME This isn't perfect, there are cases in trickle where more specific
-                            // hygienic errors would be preferable ( eg: for-locals integration test )
-                            //
-                            let delta = end.column as i64 - start.column as i64;
-                            let len = usize::try_from(delta).unwrap_or(1);
-                            let prefix = " ".repeat(start.column.saturating_sub(1));
-                            let underline = "^".repeat(len);
+            //            if let Ok(t) = t {
+            if t.span.start().line != line {
+                line = t.span.start().line;
+                if let Some(Error {
+                    start,
+                    end,
+                    callout,
+                    hint,
+                    level,
+                    token,
+                }) = &error
+                {
+                    if end.line == line - 1 {
+                        printed_error = true;
+                        // FIXME This isn't perfect, there are cases in trickle where more specific
+                        // hygienic errors would be preferable ( eg: for-locals integration test )
+                        //
+                        let delta = end.column as i64 - start.column as i64;
+                        let len = usize::try_from(delta).unwrap_or(1);
+                        let prefix = " ".repeat(start.column.saturating_sub(1));
+                        let underline = "^".repeat(len);
 
-                            if let Some(token) = token {
-                                write!(self.get_writer(), "{}", token)?;
-                            };
+                        if let Some(token) = token {
+                            write!(self.get_writer(), "{}", token)?;
+                        };
 
+                        self.set_color(ColorSpec::new().set_bold(true))?;
+                        write!(self.get_writer(), "      | {}", prefix)?;
+                        self.set_color(
+                            ColorSpec::new()
+                                .set_bold(false)
+                                .set_fg(Some(level.to_color())),
+                        )?;
+                        writeln!(self.get_writer(), "{} {}", underline, callout)?;
+                        self.reset()?;
+                        if let Some(hint) = hint {
+                            let prefix = " ".repeat(start.column + len);
                             self.set_color(ColorSpec::new().set_bold(true))?;
                             write!(self.get_writer(), "      | {}", prefix)?;
                             self.set_color(
-                                ColorSpec::new()
-                                    .set_bold(false)
-                                    .set_fg(Some(level.to_color())),
+                                ColorSpec::new().set_bold(false).set_fg(Some(Color::Yellow)),
                             )?;
-                            writeln!(self.get_writer(), "{} {}", underline, callout)?;
-                            self.reset()?;
-                            if let Some(hint) = hint {
-                                let prefix = " ".repeat(start.column + len);
-                                self.set_color(ColorSpec::new().set_bold(true))?;
-                                write!(self.get_writer(), "      | {}", prefix)?;
-                                self.set_color(
-                                    ColorSpec::new().set_bold(false).set_fg(Some(Color::Yellow)),
-                                )?;
-                                writeln!(self.get_writer(), "NOTE: {}", hint)?;
-                            }
+                            writeln!(self.get_writer(), "NOTE: {}", hint)?;
                         }
-                        self.reset()?;
                     }
-                    self.set_color(ColorSpec::new().set_bold(true))?;
-                    write!(self.get_writer(), "{:5} | ", line)?;
                     self.reset()?;
                 }
+                self.set_color(ColorSpec::new().set_bold(true))?;
+                write!(self.get_writer(), "{:5} | ", line)?;
+                self.reset()?;
+            }
 
-                let x = t;
-                let mut c = ColorSpec::new();
-                if x.value.is_keyword() {
-                    c.set_bold(true)
-                        .set_intense(true)
-                        .set_fg(Some(Color::Green));
+            let x = t;
+            let mut c = ColorSpec::new();
+            if x.value.is_keyword() {
+                c.set_bold(true)
+                    .set_intense(true)
+                    .set_fg(Some(Color::Green));
+            }
+            if x.value.is_operator() || x.value.is_symbol() {
+                c.set_bold(true)
+                    .set_intense(true)
+                    .set_fg(Some(Color::White));
+            }
+            if x.value.is_literal() && !x.value.is_string_like() {
+                c.set_intense(true).set_fg(Some(Color::Red));
+            }
+            match &x.value {
+                Token::LineDirective(_, _) => {
+                    c.set_intense(true).set_fg(Some(Color::White));
                 }
-                if x.value.is_operator() || x.value.is_symbol() {
+                Token::SingleLineComment(_) => {
+                    c.set_intense(true).set_fg(Some(Color::Blue));
+                }
+                Token::DocComment(_) => {
+                    c.set_intense(true).set_fg(Some(Color::Cyan));
+                }
+                Token::TestLiteral(_, _) | Token::StringLiteral(_) => {
+                    c.set_intense(true).set_fg(Some(Color::Magenta));
+                }
+                Token::Bad(_) => {
                     c.set_bold(true)
                         .set_intense(true)
+                        .set_bg(Some(Color::Red))
                         .set_fg(Some(Color::White));
                 }
-                if x.value.is_literal() && !x.value.is_string_like() {
-                    c.set_intense(true).set_fg(Some(Color::Red));
+                Token::Ident(_, _) => {
+                    c.set_intense(true).set_fg(Some(Color::Yellow));
                 }
-                match &x.value {
-                    Token::SingleLineComment(_) => {
-                        c.set_intense(true).set_fg(Some(Color::Blue));
-                    }
-                    Token::DocComment(_) => {
-                        c.set_intense(true).set_fg(Some(Color::Cyan));
-                    }
-                    Token::TestLiteral(_, _) | Token::StringLiteral(_) => {
-                        c.set_intense(true).set_fg(Some(Color::Magenta));
-                    }
-                    Token::Bad(_) => {
-                        c.set_bold(true)
-                            .set_intense(true)
-                            .set_bg(Some(Color::Red))
-                            .set_fg(Some(Color::White));
-                    }
-                    Token::Ident(_, _) => {
-                        c.set_intense(true).set_fg(Some(Color::Yellow));
-                    }
-                    _other => (), // Just an empty spec
-                }
-                self.set_color(&mut c)?;
-                match &x.value {
-                    Token::HereDoc(indent, lines) => {
-                        writeln!(self.get_writer(), r#"""""#)?;
-                        for l in lines {
-                            line += 1;
-                            self.reset()?;
-                            self.set_color(ColorSpec::new().set_bold(true))?;
-                            write!(self.get_writer(), "{:5} | ", line)?;
-                            self.reset()?;
-                            c.set_intense(true).set_fg(Some(Color::Magenta));
-                            writeln!(self.get_writer(), "{}{}", " ".repeat(*indent), l)?
-                        }
+                _other => (), // Just an empty spec
+            }
+            self.set_color(&mut c)?;
+            match &x.value {
+                Token::HereDoc(indent, lines) => {
+                    writeln!(self.get_writer(), r#"""""#)?;
+                    for l in lines {
                         line += 1;
                         self.reset()?;
                         self.set_color(ColorSpec::new().set_bold(true))?;
                         write!(self.get_writer(), "{:5} | ", line)?;
                         self.reset()?;
-                        write!(self.get_writer(), r#"""""#)?;
+                        c.set_intense(true).set_fg(Some(Color::Magenta));
+                        writeln!(self.get_writer(), "{}{}", " ".repeat(*indent), l)?
                     }
-                    Token::TestLiteral(indent, lines) => {
-                        write!(self.get_writer(), "|")?;
-                        let mut first = true;
-                        for l in lines {
-                            if first {
-                                first = false;
-                            } else {
-                                line += 1;
-                                self.reset()?;
-                                self.set_color(ColorSpec::new().set_bold(true))?;
-                                write!(self.get_writer(), "\\\n{:5} | ", line)?;
-                                self.reset()?;
-                                c.set_intense(true).set_fg(Some(Color::Magenta));
-                            }
-                            write!(self.get_writer(), "{}{}", " ".repeat(*indent), l)?
-                        }
-                        self.reset()?;
-                        write!(self.get_writer(), "|")?;
-                    }
-                    _ => write!(self.get_writer(), "{}", x.value)?,
+                    line += 1;
+                    self.reset()?;
+                    self.set_color(ColorSpec::new().set_bold(true))?;
+                    write!(self.get_writer(), "{:5} | ", line)?;
+                    self.reset()?;
+                    write!(self.get_writer(), r#"""""#)?;
                 }
+                Token::TestLiteral(indent, lines) => {
+                    write!(self.get_writer(), "|")?;
+                    let mut first = true;
+                    for l in lines {
+                        if first {
+                            first = false;
+                        } else {
+                            line += 1;
+                            self.reset()?;
+                            self.set_color(ColorSpec::new().set_bold(true))?;
+                            write!(self.get_writer(), "\\\n{:5} | ", line)?;
+                            self.reset()?;
+                            c.set_intense(true).set_fg(Some(Color::Magenta));
+                        }
+                        write!(self.get_writer(), "{}{}", " ".repeat(*indent), l)?
+                    }
+                    self.reset()?;
+                    write!(self.get_writer(), "|")?;
+                }
+                _ => write!(self.get_writer(), "{}", x.value)?,
+            }
 
-                self.reset()?;
-            };
+            self.reset()?;
+            //};
         }
         if let Some(Error {
             start,
@@ -334,7 +371,7 @@ pub trait Highlighter {
                 } else {
                     1
                 };
-                let prefix = " ".repeat(start.column - 1);
+                let prefix = " ".repeat(start.column.saturating_sub(1));
                 let underline = "^".repeat(len);
                 if let Some(token) = token {
                     write!(self.get_writer(), "{}", token)?;
@@ -426,26 +463,17 @@ impl Highlighter for Term {
     }
 }
 
-fn extract(
-    tokens: Vec<Result<TokenSpan>>,
+fn extract<'input, 'tokens>(
+    tokens: &'tokens [TokenSpan<'input>],
     start: Location,
     end: Location,
-) -> Vec<Result<TokenSpan>> {
+) -> Vec<&'tokens TokenSpan<'input>>
+where
+    'input: 'tokens,
+{
     tokens
-        .into_iter()
-        .skip_while(|t| {
-            if let Ok(t) = t {
-                t.span.end().line < start.line
-            } else {
-                false
-            }
-        })
-        .take_while(|t| {
-            if let Ok(t) = t {
-                t.span.end().line <= end.line
-            } else {
-                false
-            }
-        })
+        .iter()
+        .skip_while(|t| t.span.end().line < start.line)
+        .take_while(|t| t.span.end().line <= end.line)
         .collect()
 }

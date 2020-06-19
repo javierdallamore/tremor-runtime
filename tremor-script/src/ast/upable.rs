@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::Helper;
-use crate::errors::*;
+use crate::errors::Result;
 
 pub(crate) trait Upable<'script> {
     type Target;
@@ -23,8 +23,18 @@ pub(crate) trait Upable<'script> {
 #[allow(clippy::use_self)]
 impl<'script, U: Upable<'script>> Upable<'script> for Vec<U> {
     type Target = Vec<U::Target>;
-    fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
-        self.into_iter().map(|v| v.up(helper)).collect()
+    fn up<'registry>(mut self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
+        if let Some(last) = self.pop() {
+            let was_leaf = helper.possible_leaf;
+            helper.possible_leaf = false;
+            let r: Result<Self::Target> = self.into_iter().map(|v| v.up(helper)).collect();
+            let mut r = r?;
+            helper.possible_leaf = was_leaf;
+            r.push(last.up(helper)?);
+            Ok(r)
+        } else {
+            Ok(vec![])
+        }
     }
 }
 

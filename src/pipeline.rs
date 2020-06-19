@@ -11,7 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use crate::errors::*;
+use crate::errors::{Error, Result};
 use crate::offramp;
 use crate::registry::ServantId;
 use crate::repository::PipelineArtefact;
@@ -93,15 +93,13 @@ impl Manager {
             info!("Pipeline manager started");
             loop {
                 match rx.recv().await {
-                    Some(ManagerMsg::Stop) => {
+                    Ok(ManagerMsg::Stop) => {
                         info!("Stopping onramps...");
                         break;
                     }
-                    Some(ManagerMsg::Create(r, create)) => {
-                        r.send(self.start_pipeline(create)).await
-                    }
-                    None => {
-                        info!("Stopping onramps...");
+                    Ok(ManagerMsg::Create(r, create)) => r.send(self.start_pipeline(create)).await,
+                    Err(e) => {
+                        info!("Stopping onramps... {}", e);
                         break;
                     }
                 }

@@ -55,11 +55,6 @@ pub fn load(registry: &mut Registry) {
 mod test {
     use crate::registry::fun;
     use simd_json::BorrowedValue as Value;
-    macro_rules! assert_val {
-        ($e:expr, $r:expr) => {
-            assert_eq!($e, Ok(Value::from($r)))
-        };
-    }
 
     #[test]
     fn replace() {
@@ -95,14 +90,6 @@ mod test {
         let f = fun("re", "split");
         let v1 = Value::from(" ");
         let v2 = Value::from("this is a test");
-        assert_val!(
-            f(&[&v1, &v2]),
-            Value::Array(vec![
-                Value::from("this"),
-                Value::from("is"),
-                Value::from("a"),
-                Value::from("test")
-            ])
-        )
+        assert_val!(f(&[&v1, &v2]), Value::from(vec!["this", "is", "a", "test"]))
     }
 }

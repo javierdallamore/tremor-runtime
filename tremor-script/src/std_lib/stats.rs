@@ -18,7 +18,6 @@ use crate::registry::{
 };
 use halfbrown::hashmap;
 use hdrhistogram::Histogram;
-use math as libmath;
 use simd_json::prelude::*;
 use simd_json::value::borrowed::Value;
 use sketches_ddsketch::{Config as DDSketchConfig, DDSketch};
@@ -27,6 +26,24 @@ use std::f64;
 use std::marker::Send;
 use std::ops::RangeInclusive;
 use std::u64;
+
+/// Round up.
+///
+/// Round `value` up to accuracy defined by `scale`.
+/// Positive `scale` defines the number of decimal digits in the result
+/// while negative `scale` rounds to a whole number and defines the number
+/// of trailing zeroes in the result.
+///
+/// # Arguments
+///
+/// * `value` - value to round
+/// * `scale` - result accuracy
+///
+/// taken from <https://github.com/0x022b/libmath-rs/blob/af3aff7e1500e5f801e73f3c464ea7bf81ec83c7/src/round.rs>
+pub fn ceil(value: f64, scale: i8) -> f64 {
+    let multiplier = 10_f64.powi(i32::from(scale)) as f64;
+    (value * multiplier).ceil() / multiplier
+}
 
 #[derive(Clone, Debug, Default)]
 struct Count(i64);
@@ -67,18 +84,22 @@ impl TremorAggrFn for Sum {
     fn accumulate<'event>(&mut self, args: &[&Value<'event>]) -> FResult<()> {
         if let Some(v) = args[0].cast_f64() {
             self.0 += v;
+            Ok(())
         } else {
-            // FIXME type error
+            Err(FunctionError::BadType {
+                mfa: mfa("stats", "sum", 1),
+            })
         }
-        Ok(())
     }
     fn compensate<'event>(&mut self, args: &[&Value<'event>]) -> FResult<()> {
         if let Some(v) = args[0].cast_f64() {
             self.0 -= v;
+            Ok(())
         } else {
-            // FIXME type error
+            Err(FunctionError::BadType {
+                mfa: mfa("stats", "sum", 1),
+            })
         }
-        Ok(())
     }
     fn emit<'event>(&mut self) -> FResult<Value<'event>> {
         Ok(Value::from(self.0))
@@ -109,19 +130,23 @@ impl TremorAggrFn for Mean {
         self.0 += 1;
         if let Some(v) = args[0].cast_f64() {
             self.1 += v;
+            Ok(())
         } else {
-            // FIXME type error
+            Err(FunctionError::BadType {
+                mfa: mfa("stats", "mean", 1),
+            })
         }
-        Ok(())
     }
     fn compensate<'event>(&mut self, args: &[&Value<'event>]) -> FResult<()> {
         self.0 -= 1;
         if let Some(v) = args[0].cast_f64() {
             self.1 -= v;
+            Ok(())
         } else {
-            // FIXME type errpr
+            Err(FunctionError::BadType {
+                mfa: mfa("stats", "mean", 1),
+            })
         }
-        Ok(())
     }
     fn emit<'event>(&mut self) -> FResult<Value<'event>> {
         if self.0 == 0 {
@@ -159,10 +184,12 @@ impl TremorAggrFn for Min {
             if self.0.is_none() || Some(v) < self.0 {
                 self.0 = Some(v);
             };
+            Ok(())
         } else {
-            // FIXME type errpr
+            Err(FunctionError::BadType {
+                mfa: mfa("stats", "min", 1),
+            })
         }
-        Ok(())
     }
     fn compensate<'event>(&mut self, _args: &[&Value<'event>]) -> FResult<()> {
         // FIXME: how?
@@ -214,10 +241,12 @@ impl TremorAggrFn for Max {
             if self.0.is_none() || Some(v) > self.0 {
                 self.0 = Some(v);
             };
+            Ok(())
         } else {
-            // FIXME type errpr
+            Err(FunctionError::BadType {
+                mfa: mfa("stats", "max", 1),
+            })
         }
-        Ok(())
     }
     fn compensate<'event>(&mut self, _args: &[&Value<'event>]) -> FResult<()> {
         // FIXME: how?
@@ -264,20 +293,24 @@ impl TremorAggrFn for Var {
             self.n += 1;
             self.ex += v - self.k;
             self.ex2 += (v - self.k) * (v - self.k);
+            Ok(())
         } else {
-            // FIXME type errpr
+            Err(FunctionError::BadType {
+                mfa: mfa("stats", "var", 1),
+            })
         }
-        Ok(())
     }
     fn compensate<'event>(&mut self, args: &[&Value<'event>]) -> FResult<()> {
         if let Some(v) = args[0].cast_f64() {
             self.n -= 1;
             self.ex -= v - self.k;
             self.ex2 -= (v - self.k) * (v - self.k);
+            Ok(())
         } else {
-            // FIXME type errpr
+            Err(FunctionError::BadType {
+                mfa: mfa("stats", "var", 1),
+            })
         }
-        Ok(())
     }
     fn emit<'event>(&mut self) -> FResult<Value<'event>> {
         if self.n == 0 {
@@ -462,7 +495,7 @@ impl TremorAggrFn for Dds {
                 for (pcn, percentile) in &self.percentiles {
                     match histo.quantile(*percentile) {
                         Ok(Some(quantile)) => {
-                            let quantile_dsp = libmath::round::ceil(quantile, 1); // Round for equiv with HDR ( 2 digits )
+                            let quantile_dsp = ceil(quantile, 1); // Round for equiv with HDR ( 2 digits )
                             p.insert(pcn.clone().into(), Value::from(quantile_dsp));
                         }
                         _ => {
@@ -501,7 +534,7 @@ impl TremorAggrFn for Dds {
                 for (pcn, percentile) in &self.percentiles {
                     match histo.quantile(*percentile) {
                         Ok(Some(quantile)) => {
-                            let quantile_dsp = libmath::round::ceil(quantile, 1); // Round for equiv with HDR ( 2 digits )
+                            let quantile_dsp = ceil(quantile, 1); // Round for equiv with HDR ( 2 digits )
                             p.insert(pcn.clone().into(), Value::from(quantile_dsp));
                         }
                         _ => {
@@ -1071,14 +1104,7 @@ mod test {
             }
             a.accumulate(&[
                 &Value::from(i),
-                &Value::Array(vec![
-                    Value::String(std::borrow::Cow::Borrowed("0.5")),
-                    Value::String(std::borrow::Cow::Borrowed("0.9")),
-                    Value::String(std::borrow::Cow::Borrowed("0.95")),
-                    Value::String(std::borrow::Cow::Borrowed("0.99")),
-                    Value::String(std::borrow::Cow::Borrowed("0.999")),
-                    Value::String(std::borrow::Cow::Borrowed("0.9999")),
-                ]),
+                &Value::from(vec!["0.5", "0.9", "0.95", "0.99", "0.999", "0.9999"]),
             ])?;
             i += 1;
         }
@@ -1118,14 +1144,7 @@ mod test {
             }
             a.accumulate(&[
                 &Value::from(i),
-                &Value::Array(vec![
-                    Value::String(std::borrow::Cow::Borrowed("0.5")),
-                    Value::String(std::borrow::Cow::Borrowed("0.9")),
-                    Value::String(std::borrow::Cow::Borrowed("0.95")),
-                    Value::String(std::borrow::Cow::Borrowed("0.99")),
-                    Value::String(std::borrow::Cow::Borrowed("0.999")),
-                    Value::String(std::borrow::Cow::Borrowed("0.9999")),
-                ]),
+                &Value::from(vec!["0.5", "0.9", "0.95", "0.99", "0.999", "0.9999"]),
             ])?;
             i += 1;
         }

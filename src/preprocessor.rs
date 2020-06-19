@@ -16,8 +16,7 @@ mod gelf;
 pub(crate) use gelf::GELF;
 pub mod lines;
 
-use crate::errors::*;
-use base64;
+use crate::errors::Result;
 use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
 use bytes::buf::Buf;
 use bytes::BytesMut;
@@ -36,9 +35,11 @@ pub trait Preprocessor: Sync + Send {
 pub fn lookup(name: &str) -> Result<Box<dyn Preprocessor>> {
     match name {
         // TODO once preprocessors allow configuration, remove multiple entries for lines here
-        "lines" => Ok(Box::new(Lines::new('\n', 1_048_576))),
-        "lines-null" => Ok(Box::new(Lines::new('\0', 1_048_576))),
-        "lines-pipe" => Ok(Box::new(Lines::new('|', 1_048_576))),
+        "lines" => Ok(Box::new(Lines::new('\n', 1_048_576, true))),
+        "lines-null" => Ok(Box::new(Lines::new('\0', 1_048_576, true))),
+        "lines-pipe" => Ok(Box::new(Lines::new('|', 1_048_576, true))),
+        "lines-no-buffer" => Ok(Box::new(Lines::new('\n', 0, false))),
+        "lines-cr-no-buffer" => Ok(Box::new(Lines::new('\r', 0, false))),
         "base64" => Ok(Box::new(Base64::default())),
         "gzip" => Ok(Box::new(Gzip::default())),
         "zlib" => Ok(Box::new(Zlib::default())),
@@ -445,6 +446,80 @@ mod test {
         let out = "snot".as_bytes();
         assert_not_symmetric!(int, enc, out, Lines);
         Ok(())
+    }
+
+    macro_rules! assert_no_buffer {
+        ($inbound:expr, $outbound1:expr, $outbound2:expr, $case_number:expr, $separator:expr) => {
+            let mut ingest_ns = 0u64;
+            let r = crate::preprocessor::Lines::new($separator, 0, false)
+                .process(&mut ingest_ns, $inbound);
+
+            let out = &r?;
+            // Assert preprocessor output is as expected
+            assert!(
+                2 == out.len(),
+                "Test case : {} => expected output = {}, actual output = {}",
+                $case_number,
+                "2",
+                out.len()
+            );
+            assert!(
+                $outbound1 == out[0].as_slice(),
+                "Test case : {} => expected output = \"{}\", actual output = \"{}\"",
+                $case_number,
+                std::str::from_utf8($outbound1).unwrap(),
+                std::str::from_utf8(out[0].as_slice()).unwrap()
+            );
+            assert!(
+                $outbound2 == out[1].as_slice(),
+                "Test case : {} => expected output = \"{}\", actual output = \"{}\"",
+                $case_number,
+                std::str::from_utf8($outbound2).unwrap(),
+                std::str::from_utf8(out[1].as_slice()).unwrap()
+            );
+        };
+    }
+
+    #[test]
+    fn test_lines_no_buffer_no_maxlength() -> Result<()> {
+        let test_data = get_data_for_test_lines_no_buffer_no_maxlength();
+        for case in &test_data {
+            assert_no_buffer!(case.0, case.1, case.2, case.3, '\n');
+        }
+
+        Ok(())
+    }
+
+    fn get_data_for_test_lines_no_buffer_no_maxlength(
+    ) -> [(&'static [u8], &'static [u8], &'static [u8], &'static str); 5] {
+        [
+            (b"snot\nbadger", b"snot", b"badger", "0"),
+            (b"snot\nbadger\n", b"snot", b"badger", "1"),
+            (b"snot\nbadger\n\n", b"snot", b"badger", "2"),
+            (b"snot\n\nbadger", b"snot", b"badger", "3"),
+            (b"\nsnot\nbadger", b"snot", b"badger", "4"),
+        ]
+    }
+
+    #[test]
+    fn test_carriage_return_no_buffer_no_maxlength() -> Result<()> {
+        let test_data = get_data_for_test_carriage_return_no_buffer_no_maxlength();
+        for case in &test_data {
+            assert_no_buffer!(case.0, case.1, case.2, case.3, '\r');
+        }
+
+        Ok(())
+    }
+
+    fn get_data_for_test_carriage_return_no_buffer_no_maxlength(
+    ) -> [(&'static [u8], &'static [u8], &'static [u8], &'static str); 5] {
+        [
+            (b"snot\rbadger", b"snot", b"badger", "0"),
+            (b"snot\rbadger\r", b"snot", b"badger", "1"),
+            (b"snot\rbadger\r\r", b"snot", b"badger", "2"),
+            (b"snot\r\rbadger", b"snot", b"badger", "3"),
+            (b"\rsnot\rbadger", b"snot", b"badger", "4"),
+        ]
     }
 
     #[test]

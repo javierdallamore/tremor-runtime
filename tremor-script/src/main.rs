@@ -36,6 +36,7 @@ mod highlighter;
 mod interpreter;
 mod lexer;
 mod parser;
+mod path;
 mod pos;
 mod registry;
 mod script;
@@ -45,9 +46,12 @@ mod utils;
 #[macro_use]
 extern crate rental;
 
-use crate::errors::*;
+use crate::errors::{Error, ErrorKind, Result};
 use crate::highlighter::{Highlighter, Term as TermHighlighter};
+use crate::path::load as load_module_path;
+use crate::pos::{Span, Spanned};
 use crate::script::{AggrType, Return, Script};
+use chrono::{Timelike, Utc};
 use clap::{App, Arg};
 use ctx::{EventContext, EventOriginUri};
 use halfbrown::hashmap;
@@ -63,8 +67,29 @@ extern crate serde_derive;
 
 use crate::registry::Registry;
 
-#[allow(clippy::too_many_lines)]
+/// Default recursion limit
+pub const RECURSION_LIMIT: u32 = 1024;
+/// recursion limit
+///
+#[inline]
+pub fn recursion_limit() -> u32 {
+    RECURSION_LIMIT
+}
+
+/// Get a nanosecond timestamp
+#[allow(clippy::cast_sign_loss)]
+fn nanotime() -> u64 {
+    let now = Utc::now();
+    let seconds: u64 = now.timestamp() as u64;
+    let nanoseconds: u64 = u64::from(now.nanosecond());
+
+    (seconds * 1_000_000_000) + nanoseconds
+}
+
+#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 fn main() -> Result<()> {
+    let module_path = load_module_path();
+
     let matches = App::new("tremor-script")
         .version(option_env!("CARGO_PKG_VERSION").unwrap_or(""))
         .about("Tremor interpreter")
@@ -75,11 +100,21 @@ fn main() -> Result<()> {
                 .index(1),
         )
         .arg(
-            Arg::with_name("modules")
-                .short("m")
+            Arg::with_name("process")
+                .long("process")
+                .help("Processes each line on stdin through the script"),
+        )
+        .arg(
+            Arg::with_name("lex")
+                .short("l")
+                .long("lex")
+                .help("Prints the lexemes"),
+        )
+        .arg(
+            Arg::with_name("ENCODING")
+                .long("encoding")
                 .takes_value(true)
-                .multiple(true)
-                .help("The event to load."),
+                .help("The codec to decode events from stdin from"),
         )
         .arg(
             Arg::with_name("event")
@@ -99,6 +134,12 @@ fn main() -> Result<()> {
                 .short("s")
                 .takes_value(false)
                 .help("Prints the highlighted script."),
+        )
+        .arg(
+            Arg::with_name("highlight-preprocess-source")
+                .long("pre-process")
+                .takes_value(false)
+                .help("Prints the highlighted preprocessed script."),
         )
         .arg(
             Arg::with_name("print-ast")
@@ -129,6 +170,13 @@ fn main() -> Result<()> {
                 .takes_value(false)
                 .help("Replays a file containing influx line protocol."),
         )
+        .arg(
+            Arg::with_name("docs")
+                .short("d")
+                .long("docs")
+                .takes_value(true)
+                .help("Prints docs for a script."),
+        )
         .get_matches();
 
     let script_file = matches
@@ -142,45 +190,178 @@ fn main() -> Result<()> {
     #[allow(unused_mut)]
     let mut reg: Registry = registry::registry();
 
-    #[cfg(feature = "fns")]
-    {
-        if let Some(modules) = matches.values_of("modules") {
-            use std::ffi::OsStr;
-            use std::path::Path;
-            for module in modules {
-                if let Some(name) = Path::new(module)
-                    .file_stem()
-                    .and_then(OsStr::to_str)
-                    .map(ToString::to_string)
-                {
-                    let mut code = String::new();
-                    let mut input = File::open(&module)?;
-                    input.read_to_string(&mut code)?;
+    let mp = load_module_path();
 
-                    reg.load_module(&name, &code)?;
+    if matches.is_present("lex") {
+        println!();
+        raw.push('\n');
+        let mut include_stack = lexer::IncludeStack::default();
+        let cu = include_stack.push(script_file)?;
+        let lexemes = if matches.is_present("highlight-preprocess-source") {
+            lexer::Preprocessor::preprocess(
+                &crate::path::load(),
+                &script_file,
+                &mut raw,
+                cu,
+                &mut include_stack,
+            )?
+        } else {
+            lexer::Tokenizer::new(&raw).collect()
+        };
+        for l in lexemes {
+            match l {
+                Ok(Spanned {
+                    span: Span { start, end },
+                    value,
+                }) => {
+                    if start.line == end.line {
+                        println!(
+                            "{:>3}:{:3}-{:3}> {}",
+                            start.line,
+                            start.column,
+                            end.column,
+                            value.prettify()
+                        )
+                    } else {
+                        println!(
+                            "{:>3}:{:3}-{:3}:{}> {}",
+                            start.line,
+                            start.column,
+                            end.line,
+                            end.column,
+                            value.prettify()
+                        )
+                    }
                 }
+                Err(e) => println!("ERR> {}", e),
             }
         }
+        return Ok(());
     }
 
-    match Script::parse(&raw, &reg) {
+    match Script::parse(&mp, script_file, raw.clone(), &reg) {
         Ok(runnable) => {
             let mut h = TermHighlighter::new();
             runnable.format_warnings_with(&mut h)?;
 
+            if matches.is_present("process") {
+                let mut state = Value::null();
+                let codec = matches.value_of("ENCODING").unwrap_or("json");
+
+                loop {
+                    let mut input = String::new();
+                    match std::io::stdin().read_line(&mut input) {
+                        Ok(0) => {
+                            // ALLOW: main.rs
+                            std::process::exit(0);
+                        }
+                        Ok(n) => {
+                            let now = nanotime();
+                            let mut event = match codec {
+                                "json" => {
+                                    match simd_json::to_borrowed_value(unsafe {
+                                        input.as_bytes_mut()
+                                    }) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            eprintln!("invalid event: {}", e);
+                                            continue;
+                                        }
+                                    }
+                                }
+                                "influx" => match tremor_influx::decode(input.as_str(), now) {
+                                    Ok(Some(v)) => v,
+                                    Ok(None) => continue,
+                                    Err(e) => {
+                                        eprintln!("invalid event: {}", e);
+                                        continue;
+                                    }
+                                },
+
+                                "string" => Value::from(input),
+                                _ => {
+                                    // ALLOW: main.rs
+                                    std::process::exit(1);
+                                }
+                            };
+                            let mut global_map = Value::object();
+                            let r = runnable.run(
+                                &EventContext::new(nanotime(), Some(EventOriginUri::default())),
+                                AggrType::Tick,
+                                &mut event,
+                                &mut state,
+                                &mut global_map,
+                            );
+                            match r {
+                                Ok(Return::Drop) => (),
+                                Ok(Return::Emit { value, port }) => {
+                                    match port.unwrap_or_else(|| String::from("out")).as_str() {
+                                        "error" | "stderr" => eprintln!("{}", value.encode()),
+                                        _ => println!("{}", value.encode()),
+                                    }
+                                }
+                                Ok(Return::EmitEvent { port }) => {
+                                    match port.unwrap_or_else(|| String::from("out")).as_str() {
+                                        "error" | "stderr" => eprintln!("{}", event.encode()),
+                                        _ => println!("{}", event.encode()),
+                                    }
+                                }
+                                Err(e) => eprintln!("error processing event: {}", e),
+                            }
+                        }
+                        Err(error) => {
+                            // ALLOW: main.rs
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            } else if let Some(name) = matches.value_of("docs") {
+                let docs = runnable.docs();
+                let consts = &docs.consts;
+                let fns = &docs.fns;
+
+                if let Some(m) = &docs.module {
+                    println!("{}", m.print_with_name(name));
+                }
+                if !consts.is_empty() {
+                    println!("## Constants");
+                    for c in consts {
+                        println!("{}", c.to_string())
+                    }
+                }
+
+                if !fns.is_empty() {
+                    println!("## Functions");
+                    for f in fns {
+                        println!("{}", f.to_string())
+                    }
+                }
+
+                // ALLOW: main.rs
+                std::process::exit(0);
+            }
             if matches.is_present("highlight-source") {
                 println!();
                 let mut h = TermHighlighter::new();
                 Script::highlight_script_with(&raw, &mut h)?;
             }
+            if matches.is_present("highlight-preprocess-source") {
+                println!();
+                if matches.is_present("print-results-raw") {
+                } else {
+                    let mut h = TermHighlighter::new();
+                    Script::highlight_preprocess_script_with(script_file, &raw, &mut h)?;
+                }
+            }
+
             if matches.is_present("print-ast") {
-                let ast = serde_json::to_string_pretty(&runnable.script.suffix())?;
+                let ast = simd_json::to_string_pretty(&runnable.script.suffix())?;
                 println!();
                 let mut h = TermHighlighter::new();
                 Script::highlight_script_with(&ast, &mut h)?;
             }
             if matches.is_present("print-ast-raw") {
-                let ast = serde_json::to_string_pretty(&runnable.script.suffix())?;
+                let ast = simd_json::to_string_pretty(&runnable.script.suffix())?;
                 println!();
                 println!("{}", ast);
             }
@@ -188,6 +369,7 @@ fn main() -> Result<()> {
             if matches.is_present("highlight-source")
                 || matches.is_present("print-ast")
                 || matches.is_present("print-ast-raw")
+                || matches.is_present("highlight-preprocess-source")
             {
                 // ALLOW: main.rs
                 std::process::exit(0);
@@ -230,12 +412,12 @@ fn main() -> Result<()> {
                 input.read_to_string(&mut raw)?;
                 let raw = raw.trim_end().to_string();
 
-                vec![simd_json::borrowed::Value::String(raw.into())]
+                vec![simd_json::borrowed::Value::from(raw)]
             } else {
-                vec![simd_json::borrowed::Value::from(Object::new())]
+                vec![simd_json::borrowed::Value::object()]
             };
 
-            let mut global_map = Value::from(Object::new());
+            let mut global_map = Value::object();
             let mut state = Value::null();
             let mut event = events
                 .pop()
@@ -266,16 +448,18 @@ fn main() -> Result<()> {
                     } else if matches.is_present("print-result-raw") {
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&Return::Emit { value: event, port })?
+                            simd_json::to_string_pretty(&Return::Emit { value: event, port })?
                         );
                     } else {
                         let result = format!(
                             "{} ",
-                            serde_json::to_string_pretty(&Return::Emit { value: event, port })?
+                            simd_json::to_string_pretty(&Return::Emit { value: event, port })?
                         );
-                        let lexed_tokens = lexer::Tokenizer::new(&result).collect();
+                        let lexed_tokens: Vec<_> = lexer::Tokenizer::new(&result)
+                            .filter_map(Result::ok)
+                            .collect();
                         let mut h = TermHighlighter::new();
-                        h.highlight(lexed_tokens)?;
+                        h.highlight(Some(script_file), &lexed_tokens)?;
                     }
                 }
                 // Handle the other success returns
@@ -283,12 +467,14 @@ fn main() -> Result<()> {
                     println!("Interpreter ran ok");
                     if matches.is_present("quiet") {
                     } else if matches.is_present("print-result-raw") {
-                        println!("{}", serde_json::to_string_pretty(&result)?);
+                        println!("{}", simd_json::to_string_pretty(&result)?);
                     } else {
-                        let result = format!("{} ", serde_json::to_string_pretty(&result)?);
-                        let lexed_tokens = lexer::Tokenizer::new(&result).collect();
+                        let result = format!("{} ", simd_json::to_string_pretty(&result)?);
+                        let lexed_tokens: Vec<_> = lexer::Tokenizer::new(&result)
+                            .filter_map(Result::ok)
+                            .collect();
                         let mut h = TermHighlighter::new();
-                        h.highlight(lexed_tokens)?;
+                        h.highlight(Some(script_file), &lexed_tokens)?;
                     }
                 }
                 // Hande and print runtime errors.

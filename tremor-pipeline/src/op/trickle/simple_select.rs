@@ -14,13 +14,13 @@
 
 // [x] PERF0001: handle select without grouping or windows easier.
 
-use crate::errors::*;
+use crate::errors::{ErrorKind, Result};
 use crate::{Event, Operator};
 use std::borrow::Cow;
 use tremor_script::interpreter::Env;
 use tremor_script::{
     self,
-    ast::{InvokeAggrFn, SelectStmt},
+    ast::{InvokeAggrFn, Select, SelectStmt},
     prelude::*,
     query::StmtRental,
 };
@@ -66,7 +66,9 @@ impl TrickleSimpleSelect {
         Ok(Self {
             id,
             select: rentals::Select::new(stmt_rentwrapped.stmt.clone(), move |_| unsafe {
-                std::mem::transmute(select)
+                // This is sound since we keep an arc of the borrowed data in
+                // stmt
+                std::mem::transmute::<SelectStmt<'_>, SelectStmt<'static>>(select)
             }),
         })
     }
@@ -79,11 +81,7 @@ impl TrickleSimpleSelect {
 }
 
 impl Operator for TrickleSimpleSelect {
-    #[allow(
-        mutable_transmutes,
-        clippy::transmute_ptr_to_ptr,
-        clippy::too_many_lines
-    )]
+    #[allow(mutable_transmutes, clippy::transmute_ptr_to_ptr)]
     fn on_event(
         &mut self,
         _port: &str,
@@ -94,6 +92,7 @@ impl Operator for TrickleSimpleSelect {
         // We guarantee at compile time that select in itself can't have locals, so this is safe
 
         // NOTE We are unwrapping our rental wrapped stmt
+        // FIXME: add soundness reasoning
         let SelectStmt {
             stmt,
             locals,
@@ -116,6 +115,7 @@ impl Operator for TrickleSimpleSelect {
                 consts: &consts,
                 aggrs: &NO_AGGRS,
                 meta: &node_meta,
+                recursion_limit: tremor_script::recursion_limit(),
             };
             let test = guard.run(opts, &env, unwind_event, state, event_meta, &local_stack)?;
             if let Some(test) = test.as_bool() {
@@ -123,9 +123,8 @@ impl Operator for TrickleSimpleSelect {
                     return Ok(vec![]);
                 };
             } else {
-                return tremor_script::errors::query_guard_not_bool(
-                    &stmt, guard, &test, &node_meta,
-                )?;
+                let s: &Select = &stmt;
+                return tremor_script::errors::query_guard_not_bool(s, guard, &test, &node_meta)?;
             };
         }
 
@@ -136,6 +135,7 @@ impl Operator for TrickleSimpleSelect {
                 consts: &consts,
                 aggrs: &NO_AGGRS,
                 meta: &node_meta,
+                recursion_limit: tremor_script::recursion_limit(),
             };
             let test = guard.run(opts, &env, unwind_event, state, event_meta, &local_stack)?;
             if let Some(test) = test.as_bool() {
@@ -143,9 +143,8 @@ impl Operator for TrickleSimpleSelect {
                     return Ok(vec![]);
                 };
             } else {
-                return tremor_script::errors::query_guard_not_bool(
-                    &stmt, guard, &test, &node_meta,
-                )?;
+                let s: &Select = &stmt;
+                return tremor_script::errors::query_guard_not_bool(s, guard, &test, &node_meta)?;
             };
         }
 

@@ -18,6 +18,7 @@ use tremor_pipeline::FN_REGISTRY;
 use tremor_runtime;
 use tremor_runtime::errors::*;
 use tremor_script::highlighter::{Dumb, Highlighter};
+use tremor_script::path::ModulePath;
 use tremor_script::Script;
 
 macro_rules! test_cases {
@@ -27,6 +28,7 @@ macro_rules! test_cases {
             fn $file() -> Result<()> {
 
                 tremor_runtime::functions::load()?;
+                let script_dir = concat!("tests/script_errors/", stringify!($file), "/").to_string();
                 let script_file = concat!("tests/script_errors/", stringify!($file), "/script.tremor");
                 let err_file = concat!("tests/script_errors/", stringify!($file), "/error.txt");
 
@@ -34,12 +36,14 @@ macro_rules! test_cases {
                 let mut file = File::open(script_file)?;
                 let mut contents = String::new();
                 file.read_to_string(&mut contents)?;
+                let contents2 = contents.clone();
 
+                println!("Loading error: {}", err_file);
                 let mut file = File::open(err_file)?;
                 let mut err = String::new();
                 file.read_to_string(&mut err)?;
                 let err = err.trim();
-                let s = Script::parse(&contents, &*FN_REGISTRY.lock()?);
+                let s = Script::parse(&ModulePath { mounts: vec![script_dir, "tremor-script/lib".to_string()] }, script_file, contents2, &*FN_REGISTRY.lock()?);
                 if let Err(e) = s {
                     let mut h = Dumb::new();
                     Script::format_error_from_script(&contents, &mut h, &e)?;
@@ -65,6 +69,7 @@ macro_rules! ignored_cases {
             fn $file() -> Result<()> {
 
                 tremor_runtime::functions::load()?;
+                let script_dir = concat!("tests/script_errors/", stringify!($file), "/").to_string();
                 let script_file = concat!("tests/script_errors/", stringify!($file), "/script.tremor");
                 let err_file = concat!("tests/script_errors/", stringify!($file), "/error.txt");
 
@@ -72,12 +77,13 @@ macro_rules! ignored_cases {
                 let mut file = File::open(script_file)?;
                 let mut contents = String::new();
                 file.read_to_string(&mut contents)?;
+                let contents2 = contents.clone();
 
                 let mut file = File::open(err_file)?;
                 let mut err = String::new();
                 file.read_to_string(&mut err)?;
                 let _err = err.trim();
-                let s = Script::parse(&contents, &*FN_REGISTRY.lock()?);
+                let s = Script::parse(&ModulePath { mounts: vec![script_dir, "tremor-script/lib".to_string()] }, script_file, contents2, &*FN_REGISTRY.lock()?);
                 if let Err(e) = s {
                     let mut h = Dumb::new();
                     Script::format_error_from_script(&contents, &mut h, &e)?;
@@ -118,9 +124,22 @@ test_cases!(
     lexer_unterminated_ident2,
     lexer_unterminated_string2,
     unknown_extractor,
+    pp_unrecognized_token,
+    pp_unrecognized_token2,
+    pp_unrecognized_token3,
+    pp_unrecognized_token4,
+    pp_unrecognized_token5,
+    pp_mod_not_found,
+    unknown_function_in_function,
+    mod_bound_cross,
+    pp_cyclic,
+    pp_nest_cyclic,
+    //INSERT
+    error_in_include,
 );
 
 ignored_cases!(
+    pp_unknown_function_in_function,
     lexer_bad_float,
     lexer_bad_hex,
     lexer_bad_hex2,

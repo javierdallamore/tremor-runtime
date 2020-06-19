@@ -16,12 +16,21 @@
 // We want to keep the names here
 #![allow(clippy::module_name_repetitions)]
 use super::upable::Upable;
-use super::*;
-use crate::errors::*;
+use super::{
+    base_expr, is_lit, path_eq, query, replace_last_shadow_use, ArrayPattern,
+    ArrayPredicatePattern, AssignPattern, BinExpr, BinOpKind, Comprehension, ComprehensionCase,
+    ConstDoc, EmitExpr, Env, EventPath, Expr, Field, FnDecl, FnDoc, Helper, Ident,
+    ImutComprehension, ImutComprehensionCase, ImutExpr, ImutExprInt, ImutMatch,
+    ImutPredicateClause, Invocable, Invoke, InvokeAggr, InvokeAggrFn, List, Literal, LocalPath,
+    Match, Merge, MetadataPath, ModDoc, NodeMetas, Patch, PatchOperation, Path, Pattern,
+    PredicateClause, PredicatePattern, Predicates, Record, RecordPattern, Recur, Script, Segment,
+    StatePath, TestExpr, TuplePattern, UnaryExpr, UnaryOpKind, Warning,
+};
+use crate::errors::{error_generic, error_oops, ErrorKind, Result};
 use crate::impl_expr;
 use crate::interpreter::{exec_binary, exec_unary};
 use crate::pos::{Location, Range};
-use crate::registry::{Aggr as AggrRegistry, Registry};
+use crate::registry::CustomFn;
 use crate::tilde::Extractor;
 use crate::EventContext;
 pub use base_expr::BaseExpr;
@@ -32,39 +41,55 @@ use simd_json::value::borrowed;
 use simd_json::{prelude::*, BorrowedValue as Value, KnownKey};
 use std::borrow::Cow;
 
+const NO_AGGRS: [InvokeAggrFn<'static>; 0] = [];
+const NO_CONSTS: Vec<Value<'static>> = Vec::new();
+
 /// A raw script we got to put this here because of silly lalrpoop focing it to be public
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ScriptRaw<'script> {
     exprs: ExprsRaw<'script>,
+    doc: Option<Vec<Cow<'script, str>>>,
 }
 
 impl<'script> ScriptRaw<'script> {
-    pub(crate) fn new(exprs: ExprsRaw<'script>) -> Self {
-        Self { exprs }
+    pub(crate) fn new(exprs: ExprsRaw<'script>, doc: Option<Vec<Cow<'script, str>>>) -> Self {
+        Self { exprs, doc }
     }
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn up_script<'registry>(
         self,
-        reg: &'registry Registry,
-        aggr_reg: &'registry AggrRegistry,
+        mut helper: &mut Helper<'script, 'registry>,
     ) -> Result<(Script<'script>, Vec<Warning>)> {
-        let mut helper = Helper::new(reg, aggr_reg);
-        helper.consts.insert("window".to_owned(), WINDOW_CONST_ID);
-        helper.consts.insert("group".to_owned(), GROUP_CONST_ID);
-        helper.consts.insert("args".to_owned(), ARGS_CONST_ID);
+        helper
+            .consts
+            .insert(vec!["window".to_owned()], WINDOW_CONST_ID);
+        helper
+            .consts
+            .insert(vec!["group".to_owned()], GROUP_CONST_ID);
+        helper.consts.insert(vec!["args".to_owned()], ARGS_CONST_ID);
 
         // TODO: Document why three `null` values are put in the constants vector.
-        let mut consts: Vec<Value> = vec![Value::null(); 3];
+        helper.const_values = vec![Value::null(); 3];
         let mut exprs = vec![];
         let last_idx = self.exprs.len() - 1;
         for (i, e) in self.exprs.into_iter().enumerate() {
             match e {
+                ExprRaw::Module(m) => {
+                    m.define(&mut helper)?;
+                }
                 ExprRaw::Const {
                     name,
                     expr,
                     start,
                     end,
+                    comment,
                 } => {
-                    if let Some(_prev) = helper.consts.insert(name.to_string(), consts.len()) {
+                    let name_v = vec![name.to_string()];
+                    if helper
+                        .consts
+                        .insert(name_v.clone(), helper.const_values.len())
+                        .is_some()
+                    {
                         return Err(ErrorKind::DoubleConst(
                             Range::from((start, end)).expand_lines(2),
                             Range::from((start, end)),
@@ -77,17 +102,39 @@ impl<'script> ScriptRaw<'script> {
                     if i == last_idx {
                         exprs.push(Expr::Imut(ImutExprInt::Local {
                             is_const: true,
-                            idx: consts.len(),
-                            mid: helper.add_meta_w_name(start, end, name),
+                            idx: helper.const_values.len(),
+                            mid: helper.add_meta_w_name(start, end, &name),
                         }))
                     }
+                    let expr = expr.reduce(&helper)?;
 
-                    consts.push(reduce2(expr, &helper)?);
+                    let v = reduce2(expr, &helper)?;
+                    let value_type = v.value_type();
+                    helper.const_values.push(v);
+                    helper.docs.consts.push(ConstDoc {
+                        name,
+                        doc: comment
+                            .map(|d| d.iter().map(|l| l.trim()).collect::<Vec<_>>().join("\n")),
+                        value_type,
+                    });
                 }
                 #[allow(unreachable_code, unused_variables)]
                 #[cfg_attr(tarpaulin, skip)]
-                ExprRaw::FnDecl(_f) => {
-                    return Err("Functions are not supported outside of modules.".into());
+                ExprRaw::FnDecl(f) => {
+                    helper.docs.fns.push(f.doc());
+
+                    let f = f.up(&mut helper)?;
+                    let f = CustomFn {
+                        name: f.name.id,
+                        args: f.args.iter().map(|i| i.id.to_string()).collect(),
+                        locals: f.locals,
+                        body: f.body,
+                        is_const: false, // FIXME we should find a way to examine this!
+                        open: f.open,
+                        inline: f.inline,
+                    };
+
+                    helper.register_fun(f)?;
                 }
                 other => exprs.push(other.up(&mut helper)?),
             }
@@ -108,61 +155,112 @@ impl<'script> ScriptRaw<'script> {
                 }
             }
         } else {
-            return Err(ErrorKind::EmptyScript.into());
+            let expr = EmitExpr {
+                mid: 0,
+                expr: ImutExprInt::Path(Path::Event(EventPath {
+                    mid: 0,
+                    segments: vec![],
+                })),
+                port: None,
+            };
+            exprs.push(Expr::Emit(Box::new(expr)))
         }
+
+        helper.docs.module = Some(ModDoc {
+            name: "self".into(),
+            doc: self
+                .doc
+                .map(|d| d.iter().map(|l| l.trim()).collect::<Vec<_>>().join("\n")),
+        });
 
         Ok((
             Script {
+                imports: vec![], // Compiled out
                 exprs,
-                consts,
-                aggregates: helper.aggregates,
+                consts: helper.const_values.clone(),
+                aggregates: helper.aggregates.clone(),
+                windows: helper.windows.clone(),
                 locals: helper.locals.len(),
-                node_meta: helper.meta,
+                node_meta: helper.meta.clone(),
+                functions: helper.func_vec.clone(),
+                docs: helper.docs.clone(),
             },
-            helper.warnings,
+            helper.warnings.clone(),
         ))
     }
+}
 
-    #[cfg(feature = "fns")]
-    #[cfg_attr(tarpaulin, skip)]
-    pub(crate) fn load_module<'registry>(
-        self,
-        name: &str,
-        module: &mut HashMap<String, TremorFnWrapper>,
-        reg: &'registry Registry,
-        aggr_reg: &'registry AggrRegistry,
-    ) -> Result<Vec<Warning>> {
-        use crate::registry::CustomFn;
-        let mut helper = Helper::new(reg, aggr_reg);
+/// we're forced to make this pub because of lalrpop
+#[derive(Debug, PartialEq, Serialize, Clone)]
+pub struct ModuleRaw<'script> {
+    pub start: Location,
+    pub end: Location,
+    pub name: IdentRaw<'script>,
+    pub exprs: ExprsRaw<'script>,
+    pub doc: Option<Vec<Cow<'script, str>>>,
+}
+impl_expr!(ModuleRaw);
 
+impl<'script> ModuleRaw<'script> {
+    pub(crate) fn define<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<()> {
+        helper.module.push(self.name.id.to_string());
         for e in self.exprs {
             match e {
-                ExprRaw::FnDecl(f) => {
-                    unsafe {
-                        let f = f.up(&mut helper)?;
-                        module.insert(
-                            f.name.id.to_string(),
-                            TremorFnWrapper {
-                                module: name.to_string(),
-                                name: f.name.id.to_string(),
-                                fun: Box::new(CustomFn {
-                                    args: f.args.iter().map(|i| i.id.to_string()).collect(),
-                                    locals: f.locals,
-                                    // This should only ever be called from the registry which will make sure
-                                    // the source will stay loaded
-                                    body: mem::transmute(f.body),
-                                }),
-                            },
-                        );
-                    }
+                ExprRaw::Module(m) => {
+                    m.define(helper)?;
                 }
-                _other => return Err("Only functions are allowed in modules".into()),
+                ExprRaw::Const {
+                    name,
+                    expr,
+                    start,
+                    end,
+                    ..
+                } => {
+                    let mut name_v = helper.module.clone();
+                    name_v.push(name.to_string());
+                    if helper.consts.contains_key(&name_v) {
+                        return Err(ErrorKind::DoubleConst(
+                            Range::from((start, end)).expand_lines(2),
+                            Range::from((start, end)),
+                            name.to_string(),
+                        )
+                        .into());
+                    }
+                    helper
+                        .consts
+                        .insert(name_v.clone(), helper.const_values.len());
+                    let expr = expr.up(helper)?;
+                    let v = reduce2(expr, &helper)?;
+                    helper.const_values.push(v);
+                }
+                #[allow(unreachable_code, unused_variables)]
+                #[cfg_attr(tarpaulin, skip)]
+                ExprRaw::FnDecl(f) => {
+                    let f = f.up(helper)?;
+                    let f = CustomFn {
+                        name: f.name.id,
+                        args: f.args.iter().map(|i| i.id.to_string()).collect(),
+                        locals: f.locals,
+                        body: f.body,
+                        is_const: false, // FIXME: we should find a way to examine this
+                        open: f.open,
+                        inline: f.inline,
+                    };
+
+                    helper.register_fun(f)?;
+                }
+                e => {
+                    return error_generic(
+                        &e,
+                        &e,
+                        &"Can't have expressions inside of modules",
+                        &helper.meta,
+                    )
+                }
             }
         }
-
-        // let aggregates  = Vec::new();
-        // mem::swap(&mut aggregates, &mut helper.aggregates);
-        Ok(helper.warnings)
+        helper.module.pop();
+        Ok(())
     }
 }
 
@@ -179,7 +277,7 @@ impl<'script> Upable<'script> for IdentRaw<'script> {
     type Target = Ident<'script>;
     fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
         Ok(Self::Target {
-            mid: helper.add_meta(self.start, self.end),
+            mid: helper.add_meta_w_name(self.start, self.end, &self.id),
             id: self.id,
         })
     }
@@ -197,9 +295,10 @@ pub struct FieldRaw<'script> {
 impl<'script> Upable<'script> for FieldRaw<'script> {
     type Target = Field<'script>;
     fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
+        let name = ImutExprRaw::String(self.name).up(helper)?;
         Ok(Field {
             mid: helper.add_meta(self.start, self.end),
-            name: ImutExprRaw::String(self.name).up(helper)?,
+            name,
             value: self.value.up(helper)?,
         })
     }
@@ -305,11 +404,173 @@ pub(crate) fn reduce2<'script>(
 ) -> Result<Value<'script>> {
     match expr {
         ImutExprInt::Literal(Literal { value: v, .. }) => Ok(v),
+        ImutExprInt::Local {
+            is_const: true,
+            idx,
+            ..
+        } => Ok(Value::from(idx)),
         other => Err(ErrorKind::NotConstant(
             other.extent(&helper.meta),
             other.extent(&helper.meta).expand_lines(2),
         )
         .into()),
+    }
+}
+
+impl<'script> ImutExprInt<'script> {
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn reduce(self, helper: &Helper<'script, '_>) -> Result<Self> {
+        match self {
+            ImutExprInt::Unary(u) => match *u {
+                u1
+                @
+                UnaryExpr {
+                    expr: ImutExprInt::Literal(_),
+                    ..
+                } => {
+                    let expr = reduce2(u1.expr.clone(), &helper)?;
+                    let value = if let Some(v) = exec_unary(u1.kind, &expr) {
+                        v.into_owned()
+                    } else {
+                        let ex = u1.extent(&helper.meta);
+                        return Err(ErrorKind::InvalidUnary(
+                            ex.expand_lines(2),
+                            ex,
+                            u1.kind,
+                            expr.value_type(),
+                        )
+                        .into());
+                    };
+
+                    let lit = Literal { mid: u1.mid, value };
+                    Ok(ImutExprInt::Literal(lit))
+                }
+                u1 => Ok(ImutExprInt::Unary(Box::new(u1))),
+            },
+
+            ImutExprInt::Binary(b) => {
+                match *b {
+                    b1
+                    @
+                    BinExpr {
+                        lhs: ImutExprInt::Literal(_),
+                        rhs: ImutExprInt::Literal(_),
+                        ..
+                    } => {
+                        let lhs = reduce2(b1.lhs.clone(), &helper)?;
+                        let rhs = reduce2(b1.rhs.clone(), &helper)?;
+                        // TODO remove duplicate params?
+                        let value =
+                            exec_binary(&b1, &b1, &helper.meta, b1.kind, &lhs, &rhs)?.into_owned();
+                        let lit = Literal { mid: b1.mid, value };
+                        Ok(ImutExprInt::Literal(lit))
+                    }
+                    b1 => Ok(ImutExprInt::Binary(Box::new(b1))),
+                }
+            }
+            ImutExprInt::List(l) => {
+                if l.exprs.iter().map(|v| &v.0).all(is_lit) {
+                    let elements: Result<Vec<Value>> =
+                        l.exprs.into_iter().map(|v| reduce2(v.0, &helper)).collect();
+                    Ok(ImutExprInt::Literal(Literal {
+                        mid: l.mid,
+                        value: Value::from(elements?),
+                    }))
+                } else {
+                    Ok(ImutExprInt::List(l))
+                }
+            }
+            ImutExprInt::Record(r) => {
+                if r.fields.iter().all(|f| is_lit(&f.name) && is_lit(&f.value)) {
+                    let obj: Result<borrowed::Object> = r
+                        .fields
+                        .into_iter()
+                        .map(|f| {
+                            reduce2(f.name.clone(), &helper).and_then(|n| {
+                                // ALLOW: The grammer guarantees the key of a record is always a string
+                                let n = n.as_str().unwrap_or_else(|| unreachable!());
+                                reduce2(f.value, &helper).map(|v| (n.to_owned().into(), v))
+                            })
+                        })
+                        .collect();
+                    Ok(ImutExprInt::Literal(Literal {
+                        mid: r.mid,
+                        value: Value::from(obj?),
+                    }))
+                } else {
+                    Ok(ImutExprInt::Record(r))
+                }
+            }
+            ImutExprInt::Path(Path::Const(LocalPath {
+                is_const: true,
+                segments,
+                idx,
+                mid,
+            })) if segments.is_empty() && idx > LAST_RESERVED_CONST => {
+                if let Some(v) = helper.const_values.get(idx) {
+                    let lit = Literal {
+                        mid,
+                        value: v.clone(),
+                    };
+                    Ok(ImutExprInt::Literal(lit))
+                } else {
+                    error_generic(
+                        &Range::from((
+                            helper.meta.start(mid).unwrap_or_default(),
+                            helper.meta.end(mid).unwrap_or_default(),
+                        ))
+                        .expand_lines(2),
+                        &Range::from((
+                            helper.meta.start(mid).unwrap_or_default(),
+                            helper.meta.end(mid).unwrap_or_default(),
+                        )),
+                        &format!(
+                            "Invalid const reference to '{}'",
+                            helper.meta.name_dflt(mid),
+                        ),
+                        &helper.meta,
+                    )
+                }
+            }
+            ImutExprInt::Invoke1(i)
+            | ImutExprInt::Invoke2(i)
+            | ImutExprInt::Invoke3(i)
+            | ImutExprInt::Invoke(i) => {
+                if i.invocable.is_const() && i.args.iter().all(|f| is_lit(&f.0)) {
+                    let ex = i.extent(&helper.meta);
+                    let args: Result<Vec<Value<'script>>> =
+                        i.args.into_iter().map(|v| reduce2(v.0, &helper)).collect();
+                    let args = args?;
+                    // Construct a view into `args`, since `invoke` expects a slice of references.
+                    let args2: Vec<&Value<'script>> = args.iter().collect();
+                    let env = Env {
+                        context: &EventContext::default(),
+                        consts: &NO_CONSTS,
+                        aggrs: &NO_AGGRS,
+                        meta: &helper.meta,
+                        recursion_limit: crate::recursion_limit(),
+                    };
+
+                    let v = i
+                        .invocable
+                        .invoke(&env, &args2)
+                        .map_err(|e| e.into_err(&ex, &ex, Some(&helper.reg), &helper.meta))?
+                        .into_static();
+                    Ok(ImutExprInt::Literal(Literal {
+                        value: v,
+                        mid: i.mid,
+                    }))
+                } else {
+                    Ok(match i.args.len() {
+                        1 => ImutExprInt::Invoke1(i),
+                        2 => ImutExprInt::Invoke2(i),
+                        3 => ImutExprInt::Invoke3(i),
+                        _ => ImutExprInt::Invoke(i),
+                    })
+                }
+            }
+            other => Ok(other),
+        }
     }
 }
 
@@ -327,7 +588,11 @@ pub enum ExprRaw<'script> {
         start: Location,
         /// we're forced to make this pub because of lalrpop
         end: Location,
+        /// we're forced to make this pub because of lalrpop
+        comment: Option<Vec<Cow<'script, str>>>,
     },
+    /// we're forced to make this pub because of lalrpop
+    Module(ModuleRaw<'script>),
     /// we're forced to make this pub because of lalrpop
     MatchExpr(Box<MatchRaw<'script>>),
     /// we're forced to make this pub because of lalrpop
@@ -343,7 +608,7 @@ pub enum ExprRaw<'script> {
     /// we're forced to make this pub because of lalrpop
     Emit(Box<EmitExprRaw<'script>>),
     /// we're forced to make this pub because of lalrpop
-    FnDecl(FnDeclRaw<'script>),
+    FnDecl(AnyFnRaw<'script>),
     /// we're forced to make this pub because of lalrpop
     Imut(ImutExprRaw<'script>),
 }
@@ -352,6 +617,17 @@ impl<'script> Upable<'script> for ExprRaw<'script> {
     type Target = Expr<'script>;
     fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
         Ok(match self {
+            ExprRaw::Module(ModuleRaw { start, end, .. }) => {
+                // There is no code path that leads here,
+                // we still rather have an error in case we made
+                // an error then unreachable
+                #[cfg_attr(tarpaulin, skip)]
+                return Err(ErrorKind::InvalidMod(
+                    Range::from((start, end)).expand_lines(2),
+                    Range::from((start, end)),
+                )
+                .into());
+            }
             ExprRaw::Const { start, end, .. } => {
                 // There is no code path that leads here,
                 // we still rather have an error in case we made
@@ -425,6 +701,37 @@ impl<'script> Upable<'script> for ExprRaw<'script> {
         })
     }
 }
+
+impl<'script> BaseExpr for ExprRaw<'script> {
+    fn mid(&self) -> usize {
+        0
+    }
+    fn s(&self, meta: &NodeMetas) -> Location {
+        match self {
+            ExprRaw::Const { start, .. } | ExprRaw::Drop { start, .. } => *start,
+            ExprRaw::Module(e) => e.s(meta),
+            ExprRaw::MatchExpr(e) => e.s(meta),
+            ExprRaw::Assign(e) => e.s(meta),
+            ExprRaw::Comprehension(e) => e.s(meta),
+            ExprRaw::Emit(e) => e.s(meta),
+            ExprRaw::FnDecl(e) => e.s(meta),
+            ExprRaw::Imut(e) => e.s(meta),
+        }
+    }
+    fn e(&self, meta: &NodeMetas) -> Location {
+        match self {
+            ExprRaw::Const { end, .. } | ExprRaw::Drop { end, .. } => *end,
+            ExprRaw::Module(e) => e.e(meta),
+            ExprRaw::MatchExpr(e) => e.e(meta),
+            ExprRaw::Assign(e) => e.e(meta),
+            ExprRaw::Comprehension(e) => e.e(meta),
+            ExprRaw::Emit(e) => e.e(meta),
+            ExprRaw::FnDecl(e) => e.e(meta),
+            ExprRaw::Imut(e) => e.e(meta),
+        }
+    }
+}
+
 /// we're forced to make this pub because of lalrpop
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct FnDeclRaw<'script> {
@@ -433,8 +740,25 @@ pub struct FnDeclRaw<'script> {
     pub(crate) name: IdentRaw<'script>,
     pub(crate) args: Vec<IdentRaw<'script>>,
     pub(crate) body: ExprsRaw<'script>,
+    pub(crate) doc: Option<Vec<Cow<'script, str>>>,
+    pub(crate) open: bool,
+    pub(crate) inline: bool,
 }
 impl_expr!(FnDeclRaw);
+
+impl<'script> FnDeclRaw<'script> {
+    pub(crate) fn doc(&self) -> FnDoc<'script> {
+        FnDoc {
+            name: self.name.id.clone(),
+            args: self.args.iter().map(|a| a.id.clone()).collect(),
+            open: self.open,
+            doc: self
+                .doc
+                .clone()
+                .map(|d| d.iter().map(|l| l.trim()).collect::<Vec<_>>().join("\n")),
+        }
+    }
+}
 
 impl<'script> Upable<'script> for FnDeclRaw<'script> {
     type Target = FnDecl<'script>;
@@ -442,7 +766,6 @@ impl<'script> Upable<'script> for FnDeclRaw<'script> {
     fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
         let can_emit = helper.can_emit;
         let mut aggrs = Vec::new();
-        let mut consts = HashMap::new();
         let mut locals: HashMap<_, _> = self
             .args
             .iter()
@@ -451,17 +774,205 @@ impl<'script> Upable<'script> for FnDeclRaw<'script> {
             .collect();
 
         helper.can_emit = false;
-        helper.swap(&mut aggrs, &mut consts, &mut locals);
-        let body = self.body.up(helper)?;
-        helper.swap(&mut aggrs, &mut consts, &mut locals);
-        helper.can_emit = can_emit;
+        helper.is_open = self.open;
+        helper.fn_argc = self.args.len();
 
+        helper.swap2(&mut aggrs, &mut locals);
+        helper.possible_leaf = true;
+        let body = self.body.up(helper)?;
+        helper.possible_leaf = false;
+        helper.swap2(&mut aggrs, &mut locals);
+        helper.can_emit = can_emit;
+        let name = self.name.up(helper)?;
         Ok(FnDecl {
-            mid: helper.add_meta(self.start, self.end),
-            name: self.name.up(helper)?,
+            mid: helper.add_meta_w_name(self.start, self.end, &name.id),
+            name,
             args: self.args.up(helper)?,
             body,
             locals: locals.len(),
+            open: self.open,
+            inline: self.inline,
+        })
+    }
+}
+
+/// we're forced to make this pub because of lalrpop
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub enum AnyFnRaw<'script> {
+    /// we're forced to make this pub because of lalrpop
+    Match(MatchFnDeclRaw<'script>),
+    /// we're forced to make this pub because of lalrpop
+    Normal(FnDeclRaw<'script>),
+}
+impl<'script> AnyFnRaw<'script> {
+    pub(crate) fn doc(&self) -> FnDoc<'script> {
+        match self {
+            AnyFnRaw::Match(f) => f.doc(),
+            AnyFnRaw::Normal(f) => f.doc(),
+        }
+    }
+}
+
+impl<'script> Upable<'script> for AnyFnRaw<'script> {
+    type Target = FnDecl<'script>;
+    #[cfg_attr(tarpaulin, skip)]
+    fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
+        match self {
+            AnyFnRaw::Normal(f) => f.up(helper),
+            AnyFnRaw::Match(f) => f.up(helper),
+        }
+    }
+}
+
+impl<'script> BaseExpr for AnyFnRaw<'script> {
+    fn mid(&self) -> usize {
+        0
+    }
+
+    fn s(&self, _meta: &NodeMetas) -> Location {
+        match self {
+            AnyFnRaw::Match(m) => m.start,
+            AnyFnRaw::Normal(m) => m.start,
+        }
+    }
+
+    fn e(&self, _meta: &NodeMetas) -> Location {
+        match self {
+            AnyFnRaw::Match(m) => m.end,
+            AnyFnRaw::Normal(m) => m.end,
+        }
+    }
+}
+
+/// we're forced to make this pub because of lalrpop
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MatchFnDeclRaw<'script> {
+    pub(crate) start: Location,
+    pub(crate) end: Location,
+    pub(crate) name: IdentRaw<'script>,
+    pub(crate) args: Vec<IdentRaw<'script>>,
+    pub(crate) cases: Vec<PredicateClauseRaw<'script>>,
+    pub(crate) doc: Option<Vec<Cow<'script, str>>>,
+    pub(crate) open: bool,
+    pub(crate) inline: bool,
+}
+impl_expr!(MatchFnDeclRaw);
+
+impl<'script> MatchFnDeclRaw<'script> {
+    pub(crate) fn doc(&self) -> FnDoc<'script> {
+        FnDoc {
+            name: self.name.id.clone(),
+            args: self.args.iter().map(|a| a.id.clone()).collect(),
+            open: self.open,
+            doc: self
+                .doc
+                .clone()
+                .map(|d| d.iter().map(|l| l.trim()).collect::<Vec<_>>().join("\n")),
+        }
+    }
+}
+
+impl<'script> Upable<'script> for MatchFnDeclRaw<'script> {
+    type Target = FnDecl<'script>;
+    #[cfg_attr(tarpaulin, skip)]
+    fn up<'registry>(mut self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
+        let can_emit = helper.can_emit;
+        let mut aggrs = Vec::new();
+        let mut locals = HashMap::new();
+        let mut consts = HashMap::new();
+        consts.insert(vec!["args".to_owned()], ARGS_CONST_ID);
+
+        for (i, a) in self.args.iter().enumerate() {
+            locals.insert(a.id.to_string(), i);
+        }
+
+        helper.is_open = self.open;
+        helper.fn_argc = self.args.len();
+
+        helper.can_emit = false;
+        helper.swap(&mut aggrs, &mut consts, &mut locals);
+
+        let target = self
+            .args
+            .iter()
+            .map(|a| {
+                ImutExprRaw::Path(PathRaw::Local(LocalPathRaw {
+                    start: a.start,
+                    end: a.end,
+                    segments: vec![SegmentRaw::from_id(a.clone())],
+                }))
+            })
+            .collect();
+
+        let mut patterns = Vec::new();
+
+        std::mem::swap(&mut self.cases, &mut patterns);
+
+        let patterns = patterns
+            .into_iter()
+            .map(|mut c: PredicateClauseRaw| {
+                if c.pattern == PatternRaw::Default {
+                    c
+                } else {
+                    let mut exprs: ExprsRaw<'script> = self
+                        .args
+                        .iter()
+                        .enumerate()
+                        .map(|(i, a)| {
+                            ExprRaw::Assign(Box::new(AssignRaw {
+                                start: c.start,
+                                end: c.end,
+                                path: PathRaw::Local(LocalPathRaw {
+                                    start: a.start,
+                                    end: a.end,
+                                    segments: vec![SegmentRaw::from_id(a.clone())],
+                                }),
+                                expr: ExprRaw::Imut(ImutExprRaw::Path(PathRaw::Local(
+                                    LocalPathRaw {
+                                        start: a.start,
+                                        end: a.end,
+                                        segments: vec![
+                                            SegmentRaw::from_str(FN_RES_NAME, a.start, a.end),
+                                            SegmentRaw::from_usize(i, a.start, a.end),
+                                        ],
+                                    },
+                                ))),
+                            }))
+                        })
+                        .collect();
+                    exprs.append(&mut c.exprs);
+                    c.exprs = exprs;
+                    c
+                }
+            })
+            .collect();
+
+        let body = ExprRaw::MatchExpr(Box::new(MatchRaw {
+            start: self.start,
+            end: self.end,
+            target: ImutExprRaw::List(Box::new(ListRaw {
+                start: self.start,
+                end: self.end,
+                exprs: target,
+            })),
+            patterns,
+        }));
+        helper.possible_leaf = true;
+        let body = body.up(helper)?;
+        helper.possible_leaf = false;
+        let body = vec![body];
+
+        helper.swap(&mut aggrs, &mut consts, &mut locals);
+        helper.can_emit = can_emit;
+        let name = self.name.up(helper)?;
+        Ok(FnDecl {
+            mid: helper.add_meta_w_name(self.start, self.end, &name),
+            name,
+            args: self.args.up(helper)?,
+            body,
+            locals: locals.len(),
+            open: self.open,
+            inline: self.inline,
         })
     }
 }
@@ -502,62 +1013,30 @@ pub enum ImutExprRaw<'script> {
     },
     /// we're forced to make this pub because of lalrpop
     String(StringLitRaw<'script>),
+    /// we're forced to make this pub because of lalrpop
+    Recur(RecurRaw<'script>),
 }
 
 impl<'script> Upable<'script> for ImutExprRaw<'script> {
     type Target = ImutExprInt<'script>;
     #[allow(clippy::too_many_lines)]
     fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
-        Ok(match self {
-            ImutExprRaw::Binary(b) => match b.up(helper)? {
-                b1
-                @
-                BinExpr {
-                    lhs: ImutExprInt::Literal(_),
-                    rhs: ImutExprInt::Literal(_),
-                    ..
-                } => {
-                    let lhs = reduce2(b1.lhs.clone(), &helper)?;
-                    let rhs = reduce2(b1.rhs.clone(), &helper)?;
-                    // TODO remove duplicate params?
-                    let value =
-                        exec_binary(&b1, &b1, &helper.meta, b1.kind, &lhs, &rhs)?.into_owned();
-                    let lit = Literal { mid: b1.mid, value };
-                    ImutExprInt::Literal(lit)
-                }
-                b1 => ImutExprInt::Binary(Box::new(b1)),
-            },
-            ImutExprRaw::Unary(u) => match u.up(helper)? {
-                u1
-                @
-                UnaryExpr {
-                    expr: ImutExprInt::Literal(_),
-                    ..
-                } => {
-                    let expr = reduce2(u1.expr.clone(), &helper)?;
-                    let value = if let Some(v) = exec_unary(u1.kind, &expr) {
-                        v.into_owned()
-                    } else {
-                        let ex = u1.extent(&helper.meta);
-                        return Err(ErrorKind::InvalidUnary(
-                            ex.expand_lines(2),
-                            ex,
-                            u1.kind,
-                            expr.value_type(),
-                        )
-                        .into());
-                    };
-
-                    let lit = Literal { mid: u1.mid, value };
-                    ImutExprInt::Literal(lit)
-                }
-                u1 => ImutExprInt::Unary(Box::new(u1)),
-            },
+        let was_leaf = helper.possible_leaf;
+        helper.possible_leaf = false;
+        let r = Ok(match self {
+            ImutExprRaw::Recur(r) => {
+                helper.possible_leaf = was_leaf;
+                ImutExprInt::Recur(r.up(helper)?)
+            }
+            ImutExprRaw::Binary(b) => {
+                ImutExprInt::Binary(Box::new(b.up(helper)?)).reduce(helper)?
+            }
+            ImutExprRaw::Unary(u) => ImutExprInt::Unary(Box::new(u.up(helper)?)).reduce(helper)?,
             ImutExprRaw::String(mut s) => {
                 let lit = ImutExprRaw::Literal(LiteralRaw {
                     start: s.start,
                     end: s.end,
-                    value: Value::String(s.string),
+                    value: Value::from(s.string),
                 });
                 if s.exprs.is_empty() {
                     lit.up(helper)?
@@ -567,54 +1046,23 @@ impl<'script> Upable<'script> for ImutExprRaw<'script> {
                     ImutExprRaw::Invoke(InvokeRaw {
                         start: s.start,
                         end: s.end,
-                        module: "string".into(),
+                        module: vec!["core".into(), "string".into()],
                         fun: "format".into(),
                         args,
                     })
                     .up(helper)?
+                    .reduce(helper)?
                 }
             }
-            ImutExprRaw::Record(r) => {
-                let r = r.up(helper)?;
-                if r.fields.iter().all(|f| is_lit(&f.name) && is_lit(&f.value)) {
-                    let obj: Result<borrowed::Object> = r
-                        .fields
-                        .into_iter()
-                        .map(|f| {
-                            reduce2(f.name.clone(), &helper).and_then(|n| {
-                                // ALLOW: The grammer guarantees the key of a record is always a string
-                                let n = n.as_str().unwrap_or_else(|| unreachable!());
-                                reduce2(f.value, &helper).map(|v| (n.to_owned().into(), v))
-                            })
-                        })
-                        .collect();
-                    ImutExprInt::Literal(Literal {
-                        mid: r.mid,
-                        value: Value::from(obj?),
-                    })
-                } else {
-                    ImutExprInt::Record(r)
-                }
-            }
-            ImutExprRaw::List(l) => {
-                let l = l.up(helper)?;
-                if l.exprs.iter().map(|v| &v.0).all(is_lit) {
-                    let elements: Result<Vec<Value>> =
-                        l.exprs.into_iter().map(|v| reduce2(v.0, &helper)).collect();
-                    ImutExprInt::Literal(Literal {
-                        mid: l.mid,
-                        value: Value::Array(elements?),
-                    })
-                } else {
-                    ImutExprInt::List(l)
-                }
-            }
-            ImutExprRaw::Patch(p) => ImutExprInt::Patch(Box::new(p.up(helper)?)),
-            ImutExprRaw::Merge(m) => ImutExprInt::Merge(Box::new(m.up(helper)?)),
+            ImutExprRaw::Record(r) => ImutExprInt::Record(r.up(helper)?).reduce(helper)?,
+            ImutExprRaw::List(l) => ImutExprInt::List(l.up(helper)?).reduce(helper)?,
+            ImutExprRaw::Patch(p) => ImutExprInt::Patch(Box::new(p.up(helper)?)).reduce(helper)?,
+            ImutExprRaw::Merge(m) => ImutExprInt::Merge(Box::new(m.up(helper)?)).reduce(helper)?,
             ImutExprRaw::Present { path, start, end } => ImutExprInt::Present {
                 path: path.up(helper)?,
                 mid: helper.add_meta(start, end),
-            },
+            }
+            .reduce(helper)?,
             ImutExprRaw::Path(p) => match p.up(helper)? {
                 Path::Local(LocalPath {
                     is_const,
@@ -623,29 +1071,16 @@ impl<'script> Upable<'script> for ImutExprRaw<'script> {
                     ref segments,
                 }) if segments.is_empty() => ImutExprInt::Local { mid, idx, is_const },
                 p => ImutExprInt::Path(p),
-            },
-            ImutExprRaw::Literal(l) => ImutExprInt::Literal(l.up(helper)?),
+            }
+            .reduce(helper)?,
+            ImutExprRaw::Literal(l) => ImutExprInt::Literal(l.up(helper)?).reduce(helper)?,
             ImutExprRaw::Invoke(i) => {
                 if i.is_aggregate(helper) {
                     ImutExprInt::InvokeAggr(i.into_aggregate().up(helper)?)
                 } else {
-                    let ex = i.extent(&helper.meta);
                     let i = i.up(helper)?;
-                    if i.invocable.is_const() && i.args.iter().all(|f| is_lit(&f.0)) {
-                        let args: Result<Vec<Value<'script>>> =
-                            i.args.into_iter().map(|v| reduce2(v.0, &helper)).collect();
-                        let args = args?;
-
-                        // Construct a view into `args`, since `invoke` expects a slice of references.
-                        let args2: Vec<&Value<'script>> = args.iter().collect();
-                        let v = i
-                            .invocable
-                            .invoke(&EventContext::default(), &args2)
-                            .map_err(|e| e.into_err(&ex, &ex, Some(&helper.reg), &helper.meta))?;
-                        ImutExprInt::Literal(Literal {
-                            value: v,
-                            mid: i.mid,
-                        })
+                    let i = if i.can_inline() {
+                        i.inline()?
                     } else {
                         match i.args.len() {
                             1 => ImutExprInt::Invoke1(i),
@@ -653,11 +1088,65 @@ impl<'script> Upable<'script> for ImutExprRaw<'script> {
                             3 => ImutExprInt::Invoke3(i),
                             _ => ImutExprInt::Invoke(i),
                         }
-                    }
+                    };
+                    i.reduce(helper)?
                 }
             }
-            ImutExprRaw::Match(m) => ImutExprInt::Match(Box::new(m.up(helper)?)),
+            ImutExprRaw::Match(m) => {
+                helper.possible_leaf = was_leaf;
+
+                ImutExprInt::Match(Box::new(m.up(helper)?))
+            }
             ImutExprRaw::Comprehension(c) => ImutExprInt::Comprehension(Box::new(c.up(helper)?)),
+        });
+        helper.possible_leaf = was_leaf;
+        r
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RecurRaw<'script> {
+    pub start: Location,
+    pub end: Location,
+    pub exprs: ImutExprsRaw<'script>,
+}
+impl_expr!(RecurRaw);
+
+impl<'script> Upable<'script> for RecurRaw<'script> {
+    type Target = Recur<'script>;
+    fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
+        let was_leaf = helper.possible_leaf;
+        helper.possible_leaf = false;
+        if !was_leaf {
+            return Err(ErrorKind::InvalidRecur(
+                self.extent(&helper.meta).expand_lines(2),
+                self.extent(&helper.meta),
+            )
+            .into());
+        };
+        if (helper.is_open && helper.fn_argc < self.exprs.len())
+            || (!helper.is_open && helper.fn_argc != self.exprs.len())
+        {
+            return error_generic(
+                &self,
+                &self,
+                &format!(
+                    "Wrong number of arguments expected {} but got {}",
+                    helper.fn_argc,
+                    self.exprs.len()
+                ),
+                &helper.meta,
+            );
+        }
+        let exprs = self.exprs.up(helper)?.into_iter().map(ImutExpr).collect();
+        helper.possible_leaf = was_leaf;
+
+        Ok(Recur {
+            mid: helper.add_meta(self.start, self.end),
+            argc: helper.fn_argc,
+            open: helper.is_open,
+
+            exprs,
         })
     }
 }
@@ -696,6 +1185,7 @@ pub struct AssignRaw<'script> {
     pub(crate) path: PathRaw<'script>,
     pub(crate) expr: ExprRaw<'script>,
 }
+impl_expr!(AssignRaw);
 
 /// we're forced to make this pub because of lalrpop
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -710,10 +1200,14 @@ pub struct PredicateClauseRaw<'script> {
 impl<'script> Upable<'script> for PredicateClauseRaw<'script> {
     type Target = PredicateClause<'script>;
     fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
+        let was_leaf = helper.possible_leaf;
+        helper.possible_leaf = false;
         // We run the pattern first as this might reserve a local shadow
         let pattern = self.pattern.up(helper)?;
-        let exprs = self.exprs.up(helper)?;
         let guard = self.guard.up(helper)?;
+        helper.possible_leaf = was_leaf;
+        let exprs = self.exprs.up(helper)?;
+
         // If we are in an assign pattern we'd have created
         // a shadow variable, this needs to be undoine at the end
         if pattern.is_assign() {
@@ -840,7 +1334,7 @@ pub enum PatchOperationRaw<'script> {
 impl<'script> Upable<'script> for PatchOperationRaw<'script> {
     type Target = PatchOperation<'script>;
     fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
-        use PatchOperationRaw::*;
+        use PatchOperationRaw::{Copy, Erase, Insert, Merge, Move, TupleMerge, Update, Upsert};
         Ok(match self {
             Insert { ident, expr } => PatchOperation::Insert {
                 ident: ident.up(helper)?,
@@ -902,6 +1396,7 @@ pub struct ComprehensionRaw<'script> {
     pub target: ImutExprRaw<'script>,
     pub cases: ComprehensionCasesRaw<'script>,
 }
+impl_expr!(ComprehensionRaw);
 
 impl<'script> Upable<'script> for ComprehensionRaw<'script> {
     type Target = Comprehension<'script>;
@@ -1041,9 +1536,13 @@ pub enum PatternRaw<'script> {
     /// we're forced to make this pub because of lalrpop
     Array(ArrayPatternRaw<'script>),
     /// we're forced to make this pub because of lalrpop
+    Tuple(TuplePatternRaw<'script>),
+    /// we're forced to make this pub because of lalrpop
     Expr(ImutExprRaw<'script>),
     /// we're forced to make this pub because of lalrpop
     Assign(AssignPatternRaw<'script>),
+    /// we're forced to make this pub because of lalrpop
+    DoNotCare,
     /// we're forced to make this pub because of lalrpop
     Default,
 }
@@ -1051,13 +1550,15 @@ pub enum PatternRaw<'script> {
 impl<'script> Upable<'script> for PatternRaw<'script> {
     type Target = Pattern<'script>;
     fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
-        use PatternRaw::*;
+        use PatternRaw::{Array, Assign, Default, DoNotCare, Expr, Record, Tuple};
         Ok(match self {
             //Predicate(pp) => Pattern::Predicate(pp.up(helper)?),
             Record(rp) => Pattern::Record(rp.up(helper)?),
             Array(ap) => Pattern::Array(ap.up(helper)?),
+            Tuple(tp) => Pattern::Tuple(tp.up(helper)?),
             Expr(expr) => Pattern::Expr(expr.up(helper)?),
             Assign(ap) => Pattern::Assign(ap.up(helper)?),
+            DoNotCare => Pattern::DoNotCare,
             Default => Pattern::Default,
         })
     }
@@ -1076,13 +1577,13 @@ pub enum PredicatePatternRaw<'script> {
         test: TestExprRaw,
     },
     /// we're forced to make this pub because of lalrpop
-    Eq {
+    Bin {
         /// we're forced to make this pub because of lalrpop
         lhs: Cow<'script, str>,
         /// we're forced to make this pub because of lalrpop
         rhs: ImutExprRaw<'script>,
         /// we're forced to make this pub because of lalrpop
-        not: bool,
+        kind: BinOpKind,
     },
     /// we're forced to make this pub because of lalrpop
     RecordPatternEq {
@@ -1113,7 +1614,9 @@ pub enum PredicatePatternRaw<'script> {
 impl<'script> Upable<'script> for PredicatePatternRaw<'script> {
     type Target = PredicatePattern<'script>;
     fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
-        use PredicatePatternRaw::*;
+        use PredicatePatternRaw::{
+            ArrayPatternEq, Bin, FieldAbsent, FieldPresent, RecordPatternEq, TildeEq,
+        };
         Ok(match self {
             TildeEq { assign, lhs, test } => PredicatePattern::TildeEq {
                 assign,
@@ -1121,11 +1624,11 @@ impl<'script> Upable<'script> for PredicatePatternRaw<'script> {
                 lhs,
                 test: Box::new(test.up(helper)?),
             },
-            Eq { lhs, rhs, not } => PredicatePattern::Eq {
+            Bin { lhs, rhs, kind } => PredicatePattern::Bin {
                 key: KnownKey::from(lhs.clone()),
                 lhs,
                 rhs: rhs.up(helper)?,
-                not,
+                kind,
             },
             RecordPatternEq { lhs, pattern } => PredicatePattern::RecordPatternEq {
                 key: KnownKey::from(lhs.clone()),
@@ -1234,15 +1737,18 @@ pub enum ArrayPredicatePatternRaw<'script> {
     Tilde(TestExprRaw),
     /// we're forced to make this pub because of lalrpop
     Record(RecordPatternRaw<'script>),
+    /// Ignore
+    Ignore,
 }
 impl<'script> Upable<'script> for ArrayPredicatePatternRaw<'script> {
     type Target = ArrayPredicatePattern<'script>;
     fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
-        use ArrayPredicatePatternRaw::*;
+        use ArrayPredicatePatternRaw::{Expr, Ignore, Record, Tilde};
         Ok(match self {
             Expr(expr) => ArrayPredicatePattern::Expr(expr.up(helper)?),
             Tilde(te) => ArrayPredicatePattern::Tilde(te.up(helper)?),
             Record(rp) => ArrayPredicatePattern::Record(rp.up(helper)?),
+            Ignore => ArrayPredicatePattern::Ignore,
             //Array(ap) => ArrayPredicatePattern::Array(ap),
         })
     }
@@ -1266,6 +1772,29 @@ impl<'script> Upable<'script> for ArrayPatternRaw<'script> {
         })
     }
 }
+
+/// we're forced to make this pub because of lalrpop
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct TuplePatternRaw<'script> {
+    pub(crate) start: Location,
+    pub(crate) end: Location,
+    pub(crate) exprs: ArrayPredicatePatternsRaw<'script>,
+    pub(crate) open: bool,
+}
+
+impl<'script> Upable<'script> for TuplePatternRaw<'script> {
+    type Target = TuplePattern<'script>;
+    fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
+        let exprs = self.exprs.up(helper)?;
+        Ok(TuplePattern {
+            mid: helper.add_meta(self.start, self.end),
+            exprs,
+            open: self.open,
+        })
+    }
+}
+
+pub(crate) const FN_RES_NAME: &str = "__fn_assign_this_is_ugly";
 
 /// we're forced to make this pub because of lalrpop
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1296,12 +1825,14 @@ pub enum PathRaw<'script> {
     State(StatePathRaw<'script>),
     /// we're forced to make this pub because of lalrpop
     Meta(MetadataPathRaw<'script>),
+    /// we're forced to make this pub because of lalrpop
+    Const(ConstPathRaw<'script>),
 }
 
 impl<'script> Upable<'script> for PathRaw<'script> {
     type Target = Path<'script>;
     fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
-        use PathRaw::*;
+        use PathRaw::{Const, Event, Local, Meta, State};
         Ok(match self {
             Local(p) => {
                 let p = p.up(helper)?;
@@ -1311,6 +1842,7 @@ impl<'script> Upable<'script> for PathRaw<'script> {
                     Path::Local(p)
                 }
             }
+            Const(p) => Path::Const(p.up(helper)?),
             Event(p) => Path::Event(p.up(helper)?),
             State(p) => Path::State(p.up(helper)?),
             Meta(p) => Path::Meta(p.up(helper)?),
@@ -1318,118 +1850,140 @@ impl<'script> Upable<'script> for PathRaw<'script> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+/// we're forced to make this pub because of lalrpop
+pub struct SegmentRangeRaw<'script> {
+    pub(crate) start_lower: Location,
+    pub(crate) range_start: ImutExprRaw<'script>,
+    pub(crate) end_lower: Location,
+    pub(crate) start_upper: Location,
+    pub(crate) range_end: ImutExprRaw<'script>,
+    pub(crate) end_upper: Location,
+}
+
+impl<'script> Upable<'script> for SegmentRangeRaw<'script> {
+    type Target = Segment<'script>;
+    fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
+        let SegmentRangeRaw {
+            start_lower,
+            range_start,
+            end_lower,
+            start_upper,
+            range_end,
+            end_upper,
+        } = self;
+
+        let lower_mid = helper.add_meta(start_lower, end_lower);
+        let upper_mid = helper.add_meta(start_upper, end_upper);
+        let mid = helper.add_meta(start_lower, end_upper);
+        Ok(Segment::Range {
+            lower_mid,
+            upper_mid,
+            range_start: Box::new(range_start.up(helper)?),
+            range_end: Box::new(range_end.up(helper)?),
+            mid,
+        })
+    }
+}
+
+/// we're forced to make this pub because of lalrpop
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SegmentElementRaw<'script> {
+    pub(crate) expr: ImutExprRaw<'script>,
+    pub(crate) start: Location,
+    pub(crate) end: Location,
+}
+
+impl<'script> Upable<'script> for SegmentElementRaw<'script> {
+    type Target = Segment<'script>;
+    fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
+        let SegmentElementRaw { expr, start, end } = self;
+        let expr = expr.up(helper)?;
+        let r = expr.extent(&helper.meta);
+        match expr {
+            ImutExprInt::Literal(l) => match reduce2(ImutExprInt::Literal(l), &helper)? {
+                Value::String(id) => {
+                    let mid = helper.add_meta_w_name(start, end, &id);
+                    Ok(Segment::Id {
+                        key: KnownKey::from(id.clone()),
+                        mid,
+                    })
+                }
+                other => {
+                    if let Some(idx) = other.as_usize() {
+                        let mid = helper.add_meta(start, end);
+                        Ok(Segment::Idx { idx, mid })
+                    } else {
+                        Err(ErrorKind::TypeConflict(
+                            r.expand_lines(2),
+                            r,
+                            other.value_type(),
+                            vec![ValueType::I64, ValueType::String],
+                        )
+                        .into())
+                    }
+                }
+            },
+            expr => Ok(Segment::Element {
+                mid: helper.add_meta(start, end),
+                expr,
+            }),
+        }
+    }
+}
+
 /// we're forced to make this pub because of lalrpop
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum SegmentRaw<'script> {
     /// we're forced to make this pub because of lalrpop
-    Element {
-        /// we're forced to make this pub because of lalrpop
-        expr: ImutExprRaw<'script>,
-        /// we're forced to make this pub because of lalrpop
-        start: Location,
-        /// we're forced to make this pub because of lalrpop
-        end: Location,
-    },
+    Element(Box<SegmentElementRaw<'script>>),
     /// we're forced to make this pub because of lalrpop
-    Range {
-        /// we're forced to make this pub because of lalrpop
-        start_lower: Location,
-        /// we're forced to make this pub because of lalrpop
-        range_start: ImutExprRaw<'script>,
-        /// we're forced to make this pub because of lalrpop
-        end_lower: Location,
-        /// we're forced to make this pub because of lalrpop
-        start_upper: Location,
-        /// we're forced to make this pub because of lalrpop
-        range_end: ImutExprRaw<'script>,
-        /// we're forced to make this pub because of lalrpop
-        end_upper: Location,
-    },
+    Range(Box<SegmentRangeRaw<'script>>),
 }
 
 impl<'script> Upable<'script> for SegmentRaw<'script> {
     type Target = Segment<'script>;
     fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
-        use SegmentRaw::*;
-        Ok(match self {
-            Element { expr, start, end } => {
-                let expr = expr.up(helper)?;
-                let r = expr.extent(&helper.meta);
-                match expr {
-                    ImutExprInt::Literal(l) => match reduce2(ImutExprInt::Literal(l), &helper)? {
-                        Value::String(id) => {
-                            let mid = helper.add_meta_w_name(start, end, id.clone());
-                            Segment::Id {
-                                key: KnownKey::from(id.clone()),
-                                mid,
-                            }
-                        }
-                        other => {
-                            if let Some(idx) = other.as_usize() {
-                                let mid = helper.add_meta(start, end);
-                                Segment::Idx { idx, mid }
-                            } else {
-                                return Err(ErrorKind::TypeConflict(
-                                    r.expand_lines(2),
-                                    r,
-                                    other.value_type(),
-                                    vec![ValueType::I64, ValueType::String],
-                                )
-                                .into());
-                            }
-                        }
-                    },
-                    expr => {
-                        let mid = helper.add_meta(start, end);
-                        Segment::Element { mid, expr }
-                    }
-                }
-            }
-            Range {
-                start_lower,
-                range_start,
-                end_lower,
-                start_upper,
-                range_end,
-                end_upper,
-            } => {
-                let lower_mid = helper.add_meta(start_lower, end_lower);
-                let upper_mid = helper.add_meta(start_upper, end_upper);
-                let mid = helper.add_meta(start_lower, end_upper);
-                Segment::Range {
-                    lower_mid,
-                    upper_mid,
-                    range_start: Box::new(range_start.up(helper)?),
-                    range_end: Box::new(range_end.up(helper)?),
-                    mid,
-                }
-            }
-        })
+        match self {
+            SegmentRaw::Element(e) => e.up(helper),
+            SegmentRaw::Range(r) => r.up(helper),
+        }
     }
 }
 
 impl<'script> SegmentRaw<'script> {
     pub fn from_id(id: IdentRaw<'script>) -> Self {
-        SegmentRaw::Element {
+        SegmentRaw::Element(Box::new(SegmentElementRaw {
             start: id.start,
             end: id.end,
             expr: ImutExprRaw::Literal(LiteralRaw {
                 start: id.start,
                 end: id.end,
-                value: Value::String(id.id),
+                value: Value::from(id.id),
             }),
-        }
+        }))
     }
     pub fn from_str(id: &'script str, start: Location, end: Location) -> Self {
-        SegmentRaw::Element {
+        SegmentRaw::Element(Box::new(SegmentElementRaw {
             start,
             end,
             expr: ImutExprRaw::Literal(LiteralRaw {
                 start,
                 end,
-                value: Value::String(id.into()),
+                value: Value::from(id),
             }),
-        }
+        }))
+    }
+    pub fn from_usize(id: usize, start: Location, end: Location) -> Self {
+        SegmentRaw::Element(Box::new(SegmentElementRaw {
+            start,
+            end,
+            expr: ImutExprRaw::Literal(LiteralRaw {
+                start,
+                end,
+                value: Value::from(id),
+            }),
+        }))
     }
 }
 
@@ -1439,6 +1993,59 @@ impl<'script> From<ImutExprRaw<'script>> for ExprRaw<'script> {
     }
 }
 
+/// we're forced to make this pub because of lalrpop
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ConstPathRaw<'script> {
+    pub(crate) module: Vec<IdentRaw<'script>>,
+    pub(crate) start: Location,
+    pub(crate) end: Location,
+    pub(crate) segments: SegmentsRaw<'script>,
+}
+impl_expr!(ConstPathRaw);
+
+impl<'script> Upable<'script> for ConstPathRaw<'script> {
+    type Target = LocalPath<'script>;
+    fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
+        let segments = self.segments.up(helper)?;
+        let mut segments = segments.into_iter();
+        if let Some(Segment::Id { mid, .. }) = segments.next() {
+            let segments = segments.collect();
+            let id = helper.meta.name_dflt(mid);
+            let mid = helper.add_meta_w_name(self.start, self.end, &id);
+            let mut module_direct: Vec<String> =
+                self.module.iter().map(|m| m.id.to_string()).collect();
+            let mut module = helper.module.clone();
+            module.append(&mut module_direct);
+            module.push(id);
+            if let Some(idx) = helper.is_const(&module) {
+                Ok(LocalPath {
+                    is_const: true,
+                    idx: *idx,
+                    mid,
+                    segments,
+                })
+            } else {
+                error_generic(
+                    &(self.start, self.end),
+                    &(self.start, self.end),
+                    &format!(
+                        "The constant {} (absolute path) does is not defined.",
+                        module.join("::")
+                    ),
+                    &helper.meta,
+                )
+            }
+        } else {
+            // We should never encounter this
+            error_oops(
+                &(self.start, self.end),
+                0xdead_0007,
+                "Empty local path",
+                &helper.meta,
+            )
+        }
+    }
+}
 /// we're forced to make this pub because of lalrpop
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct LocalPathRaw<'script> {
@@ -1455,9 +2062,18 @@ impl<'script> Upable<'script> for LocalPathRaw<'script> {
         let mut segments = segments.into_iter();
         if let Some(Segment::Id { mid, .. }) = segments.next() {
             let segments = segments.collect();
-            let id = helper.meta.name_dflt(mid).clone();
-            let mid = helper.add_meta_w_name(self.start, self.end, id.clone());
-            if let Some(idx) = helper.is_const(&id) {
+            let id = helper.meta.name_dflt(mid);
+            let mid = helper.add_meta_w_name(self.start, self.end, &id);
+
+            // NOTE We never modularise `window`, `args` or `group`
+            //
+            let mut rel_path = if id != "args" && id != "window" && id != "group" {
+                helper.module.clone()
+            } else {
+                vec![]
+            };
+            rel_path.push(id.to_string());
+            if let Some(idx) = helper.is_const(&rel_path) {
                 Ok(LocalPath {
                     is_const: true,
                     idx: *idx,
@@ -1475,7 +2091,12 @@ impl<'script> Upable<'script> for LocalPathRaw<'script> {
             }
         } else {
             // We should never encounter this
-            error_oops(&(self.start, self.end), "Empty local path", &helper.meta)
+            error_oops(
+                &(self.start, self.end),
+                0xdead_0008,
+                "Empty local path",
+                &helper.meta,
+            )
         }
     }
 }
@@ -1584,13 +2205,23 @@ pub struct MatchRaw<'script> {
     pub(crate) target: ImutExprRaw<'script>,
     pub(crate) patterns: PredicatesRaw<'script>,
 }
+impl_expr!(MatchRaw);
 
 impl<'script> Upable<'script> for MatchRaw<'script> {
     type Target = Match<'script>;
     fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
-        let patterns = self.patterns.up(helper)?;
+        let patterns: Predicates = self
+            .patterns
+            .into_iter()
+            .map(|v| v.up(helper))
+            .collect::<Result<_>>()?;
 
-        let defaults = patterns.iter().filter(|p| p.pattern.is_default()).count();
+        let defaults = patterns
+            .iter()
+            .filter(|p| {
+                p.pattern.is_default() || (p.pattern == Pattern::Default && p.guard.is_none())
+            })
+            .count();
         match defaults {
             0 => helper.warnings.push(Warning{
                 outer: Range(self.start, self.end),
@@ -1642,12 +2273,15 @@ impl<'script> Upable<'script> for ImutMatchRaw<'script> {
 
             _ => ()
         }
-
-        Ok(ImutMatch {
+        let was_leaf = helper.possible_leaf;
+        helper.possible_leaf = false;
+        let r = Ok(ImutMatch {
             mid: helper.add_meta(self.start, self.end),
             target: self.target.up(helper)?,
             patterns,
-        })
+        });
+        helper.possible_leaf = was_leaf;
+        r
     }
 }
 
@@ -1656,7 +2290,7 @@ impl<'script> Upable<'script> for ImutMatchRaw<'script> {
 pub struct InvokeRaw<'script> {
     pub(crate) start: Location,
     pub(crate) end: Location,
-    pub(crate) module: String,
+    pub(crate) module: Vec<String>,
     pub(crate) fun: String,
     pub(crate) args: ImutExprsRaw<'script>,
 }
@@ -1665,33 +2299,75 @@ impl_expr!(InvokeRaw);
 impl<'script> Upable<'script> for InvokeRaw<'script> {
     type Target = Invoke<'script>;
     fn up<'registry>(self, helper: &mut Helper<'script, 'registry>) -> Result<Self::Target> {
-        let invocable = helper
-            .reg
-            .find(&self.module, &self.fun)
-            .map_err(|e| e.into_err(&self, &self, Some(&helper.reg), &helper.meta))?;
+        if self.module.get(0) == Some(&String::from("core")) && self.module.len() == 2 {
+            // we know a second module exists
+            let module = self.module.get(1).cloned().unwrap_or_default();
 
-        let args = self.args.up(helper)?.into_iter().map(ImutExpr).collect();
+            let invocable = helper
+                .reg
+                .find(&module, &self.fun)
+                .map_err(|e| e.into_err(&self, &self, Some(&helper.reg), &helper.meta))?;
+            let args = self.args.up(helper)?.into_iter().map(ImutExpr).collect();
+            let mf = format!("{}::{}", self.module.join("::"), self.fun);
+            Ok(Invoke {
+                mid: helper.add_meta_w_name(self.start, self.end, &mf),
+                module: self.module,
+                fun: self.fun,
+                invocable: Invocable::Intrinsic(invocable.clone()),
+                args,
+            })
+        } else {
+            // Absolute locability from without a set of nested modules
+            let mut abs_module = helper.module.clone();
+            abs_module.extend_from_slice(&self.module);
+            abs_module.push(self.fun.clone());
 
-        Ok(Invoke {
-            mid: helper.add_meta(self.start, self.end),
-            module: self.module,
-            fun: self.fun,
-            invocable: invocable.clone(),
-            args,
-        })
+            // of the form: [mod, mod1, name] - where the list of idents is effectively a fully qualified resource name
+            if let Some(f) = helper.functions.get(&abs_module) {
+                if let Some(f) = helper.func_vec.get(*f) {
+                    let invocable = Invocable::Tremor(f.clone());
+                    let args = self.args.up(helper)?.into_iter().map(ImutExpr).collect();
+                    let mf = abs_module.join("::");
+                    Ok(Invoke {
+                        mid: helper.add_meta_w_name(self.start, self.end, &mf),
+                        module: self.module,
+                        fun: self.fun,
+                        invocable,
+                        args,
+                    })
+                } else {
+                    let inner: Range = (self.start, self.end).into();
+                    let outer: Range = inner.expand_lines(3);
+                    Err(
+                        ErrorKind::MissingFunction(outer, inner, self.module, self.fun, None)
+                            .into(),
+                    )
+                }
+            } else {
+                let inner: Range = (self.start, self.end).into();
+                let outer: Range = inner.expand_lines(3);
+                Err(ErrorKind::MissingFunction(outer, inner, self.module, self.fun, None).into())
+            }
+        }
     }
 }
 
 impl<'script> InvokeRaw<'script> {
     fn is_aggregate<'registry>(&self, helper: &mut Helper<'script, 'registry>) -> bool {
-        helper.aggr_reg.find(&self.module, &self.fun).is_ok()
+        if self.module.get(0) == Some(&String::from("aggr")) && self.module.len() == 2 {
+            let module = self.module.get(1).cloned().unwrap_or_default();
+            helper.aggr_reg.find(&module, &self.fun).is_ok()
+        } else {
+            false
+        }
     }
 
     fn into_aggregate(self) -> InvokeAggrRaw<'script> {
+        let module = self.module.get(1).cloned().unwrap_or_default();
         InvokeAggrRaw {
             start: self.start,
             end: self.end,
-            module: self.module,
+            module,
             fun: self.fun,
             args: self.args,
         }
@@ -1745,7 +2421,9 @@ impl<'script> Upable<'script> for InvokeAggrRaw<'script> {
         }
         let aggr_id = helper.aggregates.len();
         let args = self.args.up(helper)?.into_iter().map(ImutExpr).collect();
-        let invoke_meta_id = helper.add_meta(self.start, self.end);
+        let mf = format!("{}::{}", self.module, self.fun);
+        let invoke_meta_id = helper.add_meta_w_name(self.start, self.end, &mf);
+
         helper.aggregates.push(InvokeAggrFn {
             mid: invoke_meta_id,
             invocable,
@@ -1754,7 +2432,7 @@ impl<'script> Upable<'script> for InvokeAggrRaw<'script> {
             fun: self.fun.clone(),
         });
         helper.is_in_aggr = false;
-        let aggr_meta_id = helper.add_meta(self.start, self.end);
+        let aggr_meta_id = helper.add_meta_w_name(self.start, self.end, &mf);
         Ok(InvokeAggr {
             mid: aggr_meta_id,
             module: self.module,

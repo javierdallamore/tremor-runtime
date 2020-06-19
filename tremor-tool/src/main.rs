@@ -31,31 +31,20 @@ extern crate serde_derive;
 #[allow(unused_extern_crates)]
 extern crate serde;
 
-use crate::errors::*;
+use crate::errors::{Error, Result};
 use async_std::task;
-use clap::load_yaml;
-use clap::ArgMatches;
-use dirs;
+use clap::{load_yaml, ArgMatches};
 use halfbrown::HashMap;
 use http_types::{headers, StatusCode};
-use simd_json::borrowed::{Object, Value};
+use simd_json::borrowed::Value;
 use simd_json::prelude::*;
 use std::ffi::OsStr;
-use std::fs;
-use std::fs::File;
-use std::io;
+use std::fs::{self, File};
 use std::io::prelude::*;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
 use std::path::Path;
-use tremor_pipeline;
-use tremor_runtime;
-use tremor_runtime::config;
-use tremor_runtime::errors;
-use tremor_runtime::functions as tr_fun;
-use tremor_runtime::utils;
-use tremor_script::grok;
-use tremor_script::interpreter::AggrType;
-use tremor_script::EventContext as Context;
+use tremor_runtime::{config, errors, functions as tr_fun, utils};
+use tremor_script::{grok, interpreter::AggrType, path::ModulePath, EventContext as Context};
 
 enum FormatKind {
     Json,
@@ -206,7 +195,12 @@ fn script_run_cmd(cmd: &ArgMatches<'_>) -> Result<()> {
     };
 
     let context = Context::new(666, None);
-    let s = tremor_script::Script::parse(&script, &*tremor_pipeline::FN_REGISTRY.lock()?)?;
+    let s = tremor_script::Script::parse(
+        &ModulePath { mounts: vec![] },
+        f,
+        script,
+        &*tremor_pipeline::FN_REGISTRY.lock()?,
+    )?;
     let mut state = Value::null();
     for (num, line) in input.lines().enumerate() {
         let l = line?;
@@ -219,7 +213,7 @@ fn script_run_cmd(cmd: &ArgMatches<'_>) -> Result<()> {
         let debuf = codec.decode(enbuf, 0);
         match debuf {
             Ok(Some(ref json)) => {
-                let mut global_map = Value::from(Object::new());
+                let mut global_map = Value::object();
                 let (mut unwind_event, _) = json.parts();
                 match s.run(
                     &context,
@@ -231,14 +225,14 @@ fn script_run_cmd(cmd: &ArgMatches<'_>) -> Result<()> {
                     Ok(_result) => {
                         println!(
                             "{}",
-                            serde_json::json!({"status": true, "data": l, "meta": global_map, "line": num, "result": _result})
+                            simd_json::json!({"status": true, "data": l, "meta": global_map, "line": num, "result": _result})
                         );
                     }
                     Err(reason) => {
                         let err_str = reason.to_string();
                         println!(
                             "{}",
-                            serde_json::json!({"status": false, "data": l, "error": err_str, "meta": global_map, "line": num})
+                            simd_json::json!({"status": false, "data": l, "error": err_str, "meta": global_map, "line": num})
                         );
                     }
                 };
@@ -246,14 +240,14 @@ fn script_run_cmd(cmd: &ArgMatches<'_>) -> Result<()> {
             Ok(_) => {
                 println!(
                     "{}",
-                    serde_json::json!({"status": false, "data": l, "error": "failed to decode", "line": num})
+                    simd_json::json!({"status": false, "data": l, "error": "failed to decode", "line": num})
                 );
             }
             Err(reason) => {
                 let err_str = reason.to_string();
                 println!(
                     "{}",
-                    serde_json::json!({"status": false, "data": l, "error": err_str, "line": num})
+                    simd_json::json!({"status": false, "data": l, "error": err_str, "line": num})
                 );
             }
         }
@@ -296,14 +290,14 @@ fn grok_run_cmd(cmd: &ArgMatches<'_>) -> Result<()> {
             Ok(j) => {
                 println!(
                     "{}",
-                    serde_json::json!({"status": true, "data": l, "meta": &test_pattern, "line": num, "grokked": j})
+                    simd_json::json!({"status": true, "data": l, "meta": &test_pattern, "line": num, "grokked": j})
                 );
             }
             Err(reason) => {
                 let err_str = reason.to_string();
                 println!(
                     "{}",
-                    serde_json::json!({"status": false, "data": l, "error": err_str, "meta": "PATTERN", "line": num})
+                    simd_json::json!({"status": false, "data": l, "error": err_str, "meta": "PATTERN", "line": num})
                 );
             }
         }
@@ -414,7 +408,7 @@ async fn conductor_target_cmd(app: &mut TremorApp<'_>, cmd: &ArgMatches<'_>) -> 
     } else if let Some(matches) = cmd.subcommand_matches("delete") {
         conductor_target_delete_cmd(app, &matches).await
     } else {
-        println!("{}", serde_json::to_string(&app.config.instances)?);
+        println!("{}", simd_json::to_string(&app.config.instances)?);
         Ok(())
     }
 }
@@ -439,7 +433,12 @@ async fn conductor_target_create_cmd(app: &mut TremorApp<'_>, cmd: &ArgMatches<'
     let id = cmd.value_of("TARGET_ID").ok_or("TARGET_ID not provided")?;
     let path_to_file = cmd.value_of("SOURCE").ok_or("SOURCE not provided")?;
     let json = load(path_to_file)?;
-    let endpoints: Vec<String> = serde_json::from_value(json)?;
+    let endpoints: Vec<String> = json
+        .as_array()
+        .ok_or_else(|| Error::from("Invalid Configuration"))?
+        .iter()
+        .filter_map(|v| (ValueTrait::as_str(v).map(String::from)))
+        .collect();
     app.config.instances.insert(id.to_string(), endpoints);
     save_config(&app.config)
 }
@@ -463,7 +462,7 @@ async fn conductor_version_cmd(app: &TremorApp<'_>, cmd: &ArgMatches<'_>) -> Res
         "{}",
         match cmd.value_of("format") {
             Some("yaml") => serde_yaml::to_string(&version)?,
-            _ => serde_json::to_string(&version)?,
+            _ => simd_json::to_string(&version)?,
         }
     );
     Ok(())
@@ -536,13 +535,7 @@ async fn conductor_binding_activate_cmd(app: &TremorApp<'_>, cmd: &ArgMatches<'_
     let ser = ser(&app, &json)?;
     let response = surf::post(&endpoint)
         .set_header(headers::CONTENT_TYPE, content_type(app))
-        .set_header(
-            unsafe {
-                // yes seriously ...
-                headers::HeaderName::from_ascii_unchecked(b"Accept".to_vec())
-            },
-            accept(app),
-        )
+        .set_header(headers::ACCEPT, accept(app))
         .body_string(ser)
         .await?;
     handle_response(response).await
@@ -648,13 +641,7 @@ async fn conductor_create_cmd(
     let endpoint = format!("{}{}", base_url, endpoint);
     let response = surf::post(&endpoint)
         .set_header(headers::CONTENT_TYPE, content_type(app))
-        .set_header(
-            unsafe {
-                // yes seriously ...
-                headers::HeaderName::from_ascii_unchecked(b"Accept".to_vec())
-            },
-            accept(app),
-        )
+        .set_header(headers::ACCEPT, accept(app))
         .body_string(ser)
         .await?;
     handle_response(response).await
@@ -704,7 +691,7 @@ async fn conductor_instance_cmd(
 // Utility code //
 //////////////////
 
-fn load(path_to_file: &str) -> Result<serde_json::Value> {
+fn load(path_to_file: &str) -> Result<simd_json::OwnedValue> {
     let mut source = File::open(path_to_file)?;
     let ext = Path::new(path_to_file)
         .extension()
@@ -716,7 +703,7 @@ fn load(path_to_file: &str) -> Result<serde_json::Value> {
     if ext == "yaml" || ext == "yml" {
         Ok(serde_yaml::from_slice(raw.as_slice())?)
     } else if ext == "json" {
-        Ok(serde_json::from_slice(raw.as_slice())?)
+        Ok(simd_json::to_owned_value(raw.as_mut_slice())?)
     } else {
         Err(Error::from(format!("Unsupported format: {}", ext)))
     }
@@ -750,9 +737,9 @@ async fn handle_response(mut response: surf::Response) -> Result<()> {
     Ok(())
 }
 
-fn ser(app: &TremorApp<'_>, json: &serde_json::Value) -> Result<String> {
+fn ser(app: &TremorApp<'_>, json: &simd_json::OwnedValue) -> Result<String> {
     Ok(match app.format {
-        FormatKind::Json => serde_json::to_string(&json)?,
+        FormatKind::Json => simd_json::to_string(&json)?,
         FormatKind::Yaml => serde_yaml::to_string(&json)?,
     })
 }

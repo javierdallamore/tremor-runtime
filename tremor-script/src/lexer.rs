@@ -15,19 +15,23 @@
 // Note: We ignore the is_* functions for coverage as they effectively are
 // only lists
 
-use crate::errors::*;
+use crate::errors::{Error, ErrorKind, Result};
 #[cfg_attr(
     feature = "cargo-clippy",
     allow(clippy::all, clippy::result_unwrap_used, clippy::unnecessary_unwrap)
 )]
 use crate::parser::g::__ToTriple;
+use crate::path::ModulePath;
 pub use crate::pos::*;
-use lalrpop_util;
 use simd_json::prelude::*;
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::ffi::OsStr;
 use std::fmt;
+use std::fs;
+use std::io::Read;
 use std::iter::Peekable;
+use std::path::{Path, PathBuf};
 use std::str::Chars;
 use unicode_xid::UnicodeXID;
 
@@ -91,6 +95,8 @@ pub enum Token<'input> {
     NewLine,
     /// a singe line comment
     SingleLineComment(&'input str),
+    /// a mod comment
+    ModComment(&'input str),
     /// a doc comment
     DocComment(&'input str),
     /// a BAD TOKEN
@@ -170,6 +176,14 @@ pub enum Token<'input> {
     Absent,
     /// the `fun` keyword
     Fun,
+    /// the `intrinsic` keyword
+    Intrinsic,
+    /// the `mod` keyword
+    Module,
+    /// the `_` token
+    DontCare,
+    /// the `recure` token
+    Recur,
 
     // Symbols
     /// the `\` backslash
@@ -226,7 +240,7 @@ pub enum Token<'input> {
     Mul,
     /// Divide `/`
     Div,
-    /// Moduly `%~
+    /// Moduly `%`
     Mod,
 
     // Symbols
@@ -238,6 +252,8 @@ pub enum Token<'input> {
     EqArrow,
     /// Semicolon `;`
     Semi,
+    /// Left Paren `%(`
+    LPatParen,
     /// Left Paren `(`
     LParen,
     /// Right Paren `)`
@@ -299,18 +315,34 @@ pub enum Token<'input> {
     Define,
     /// The `args` keyword
     Args,
+    /// The `use` keyword
+    Use,
+    /// The `as` keyword
+    As,
+    /// Preprocessor directives
+    LineDirective(Location, Cow<'input, str>),
+    /// Config Directive
+    ConfigDirective,
 }
 
 impl<'input> Token<'input> {
+    /// a prettified version of the token
+    pub fn prettify(&self) -> String {
+        if self.is_keyword() || self.is_symbol() || self.is_ignorable() {
+            format!("{}", self)
+        } else {
+            format!("{:?}", self)
+        }
+    }
     /// Is the token ignorable except when syntax or error highlighting.
     /// Is the token insignificant when parsing ( a correct ... ) source.
     #[cfg_attr(tarpaulin, skip)]
     pub(crate) fn is_ignorable(&self) -> bool {
         match *self {
-            Token::DocComment(_)
-            | Token::SingleLineComment(_)
+            Token::SingleLineComment(_)
             | Token::Whitespace(_)
-            | Token::NewLine => true,
+            | Token::NewLine
+            | Token::LineDirective(_, _) => true,
             _ => false,
         }
     }
@@ -319,50 +351,54 @@ impl<'input> Token<'input> {
     #[cfg_attr(tarpaulin, skip)]
     pub(crate) fn is_keyword(&self) -> bool {
         match *self {
-            Token::Match
-            | Token::End
-            | Token::Fun
-            | Token::Let
-            | Token::Const
-            | Token::Case
-            | Token::Of
-            | Token::When
-            | Token::Drop
-            | Token::Emit
-            | Token::Default
-            | Token::Patch
-            | Token::Insert
-            | Token::Upsert
-            | Token::Update
-            | Token::Erase
-            | Token::Move
-            | Token::Copy
-            | Token::Merge
-            | Token::For
-            | Token::Event
-            | Token::State
-            | Token::Present
-            | Token::Absent
-            | Token::Stream
-            | Token::Select
-            | Token::From
-            | Token::Where
-            | Token::With
-            | Token::Order
-            | Token::Group
-            | Token::By
-            | Token::Having
-            | Token::Into
-            | Token::Create
-            | Token::Tumbling
-            | Token::Sliding
-            | Token::Window
-            | Token::Script
-            | Token::Set
-            | Token::Each
-            | Token::Define
+            Token::Absent
             | Token::Args
-            | Token::Operator => true,
+            | Token::By
+            | Token::Case
+            | Token::Const
+            | Token::Copy
+            | Token::Create
+            | Token::Default
+            | Token::Define
+            | Token::Drop
+            | Token::Each
+            | Token::Emit
+            | Token::End
+            | Token::Erase
+            | Token::Event
+            | Token::For
+            | Token::From
+            | Token::Fun
+            | Token::Group
+            | Token::Having
+            | Token::Insert
+            | Token::Into
+            | Token::Intrinsic
+            | Token::Let
+            | Token::Match
+            | Token::Merge
+            | Token::Module
+            | Token::Move
+            | Token::Of
+            | Token::Operator
+            | Token::Order
+            | Token::Patch
+            | Token::Present
+            | Token::Script
+            | Token::Select
+            | Token::Set
+            | Token::Use
+            | Token::As
+            | Token::Sliding
+            | Token::State
+            | Token::Stream
+            | Token::Tumbling
+            | Token::Update
+            | Token::Upsert
+            | Token::When
+            | Token::Where
+            | Token::Window
+            | Token::With => true,
             _ => false,
         }
     }
@@ -371,8 +407,8 @@ impl<'input> Token<'input> {
     #[cfg_attr(tarpaulin, skip)]
     pub(crate) fn is_literal(&self) -> bool {
         match *self {
-            // Token::DontCare => true,
-            Token::Nil
+            Token::DontCare
+            | Token::Nil
             | Token::BoolLiteral(_)
             | Token::IntLiteral(_)
             | Token::FloatLiteral(_, _) => true,
@@ -396,20 +432,24 @@ impl<'input> Token<'input> {
     #[cfg_attr(tarpaulin, skip)]
     pub(crate) fn is_symbol(&self) -> bool {
         match *self {
-            Token::Colon
+            Token::BSlash
+            | Token::Colon
             | Token::ColonColon
+            | Token::Comma
+            | Token::Eq
             | Token::EqArrow
-            | Token::Semi
-            | Token::LParen
-            | Token::RParen
-            | Token::LPatBrace
             | Token::LBrace
-            | Token::RBrace
             | Token::LBracket
+            | Token::LineDirective(_, _)
+            | Token::ConfigDirective
+            | Token::LParen
+            | Token::LPatBrace
             | Token::LPatBracket
+            | Token::RBrace
             | Token::RBracket
-            | Token::BSlash
-            | Token::Comma => true,
+            | Token::RParen
+            | Token::Semi
+            | Token::TildeEq => true,
             _ => false,
         }
     }
@@ -462,12 +502,6 @@ impl<'input> __ToTriple<'input> for Spanned<Token<'input>> {
     }
 }
 
-// fn unformat_str(s: &str) -> String {
-//     s.replace(r#"\"#, r#"\\"#)
-//         .replace('"', r#"\\""#)
-//         .replace('\n', "\\n")
-//         .replace('\t', "\\t")
-// }
 // Format a token for display
 //
 #[cfg_attr(tarpaulin, skip)]
@@ -479,6 +513,7 @@ impl<'input> fmt::Display for Token<'input> {
             Token::NewLine => writeln!(f),
             Token::Ident(ref name, true) => write!(f, "`{}`", name),
             Token::Ident(ref name, false) => write!(f, "{}", name),
+            Token::ModComment(ref comment) => write!(f, "### {}", comment),
             Token::DocComment(ref comment) => write!(f, "## {}", comment),
             Token::SingleLineComment(ref comment) => write!(f, "# {}", comment),
             Token::IntLiteral(value) => write!(f, "{}", value),
@@ -486,7 +521,8 @@ impl<'input> fmt::Display for Token<'input> {
             Token::DQuote => write!(f, "\""),
             Token::StringLiteral(value) => {
                 // We do thos to ensure proper escaping
-                let s = simd_json::BorrowedValue::String(value.clone()).encode();
+                let value: &str = &value;
+                let s = simd_json::BorrowedValue::from(value).encode();
                 // Strip the quotes
                 write!(f, "{}", &s[1..s.len() - 1])
             }
@@ -500,18 +536,20 @@ impl<'input> fmt::Display for Token<'input> {
             Token::TestLiteral(indent, values) => {
                 let mut first = true;
                 write!(f, "|")?;
-                for l in values {
-                    if first {
-                        write!(f, "|")?;
-                        first = false;
-                    } else {
-                        writeln!(f)?;
-                    };
-                    writeln!(f, "{}{}", " ".repeat(*indent), l)?;
+                if values.len() == 1 {
+                    write!(f, "{}", values[0].replace('\\', "\\\\").replace('|', "\\|"))?;
+                } else {
+                    for l in values {
+                        if first {
+                            first = false;
+                        } else {
+                            write!(f, "\\\n{}", " ".repeat(*indent))?;
+                        };
+                        write!(f, "{}", l.replace('\\', "\\\\").replace('|', "\\|"))?;
+                    }
                 }
                 write!(f, "|")
             }
-
             Token::BoolLiteral(value) => write!(f, "{}", value),
             Token::Bad(value) => write!(f, "{}", value),
             Token::Let => write!(f, "let"),
@@ -541,6 +579,8 @@ impl<'input> fmt::Display for Token<'input> {
             Token::Of => write!(f, "of"),
             Token::When => write!(f, "when"),
             Token::Default => write!(f, "default"),
+            Token::Intrinsic => write!(f, "intrinsic"),
+            Token::Module => write!(f, "mod"),
             Token::BSlash => write!(f, "\\"),
             Token::Colon => write!(f, ":"),
             Token::ColonColon => write!(f, "::"),
@@ -554,9 +594,10 @@ impl<'input> fmt::Display for Token<'input> {
             Token::Not => write!(f, "not"),
             Token::BitNot => write!(f, "!"),
             //            Token::Tilde => write!(f, "~"),
-            // Token::DontCare => write!(f, "_"),
+            Token::DontCare => write!(f, "_"),
             Token::EqArrow => write!(f, "=>"),
             Token::Semi => write!(f, ";"),
+            Token::LPatParen => write!(f, "%("),
             Token::LParen => write!(f, "("),
             Token::RParen => write!(f, ")"),
             Token::LPatBrace => write!(f, "%{{"),
@@ -610,6 +651,15 @@ impl<'input> fmt::Display for Token<'input> {
             Token::Each => write!(f, "each"),
             Token::Define => write!(f, "define"),
             Token::Args => write!(f, "args"),
+            Token::Use => write!(f, "use"),
+            Token::As => write!(f, "as"),
+            Token::Recur => write!(f, "recur"),
+            Token::ConfigDirective => write!(f, "#!config "),
+            Token::LineDirective(l, file) => write!(
+                f,
+                "#!line {} {} {} {} {}",
+                l.absolute, l.line, l.column, l.unit_id, file
+            ),
         }
     }
 }
@@ -629,6 +679,7 @@ impl<'input> CharLocations<'input> {
                 line: 1,
                 column: 1,
                 absolute: input.start_index().to_usize(),
+                unit_id: 0,
             },
             chars: input.src().chars().peekable(),
         }
@@ -649,10 +700,10 @@ impl<'input> Iterator for CharLocations<'input> {
 
 /// A Tremor tokeniser
 pub struct Tokenizer<'input> {
+    //cu: usize,
     eos: bool,
     pos: Span,
     iter: Peekable<Lexer<'input>>,
-    //line: usize,
 }
 
 impl<'input> Tokenizer<'input> {
@@ -662,6 +713,7 @@ impl<'input> Tokenizer<'input> {
         let start = Location::default();
         let end = Location::default();
         Tokenizer {
+            //cu: 0,
             eos: false,
             iter: lexer.peekable(),
             pos: span(start, end),
@@ -692,18 +744,496 @@ impl<'input> Iterator for Tokenizer<'input> {
     }
 }
 
+/// A lexical preprocessor in the spirit of cpp
+///
+pub struct Preprocessor {}
+
+macro_rules! take_while {
+    ($let:ident, $token:pat, $iter:expr) => {
+        $let = $iter.next();
+        loop {
+            if let Some(Ok(Spanned { value: $token, .. })) = $let {
+                $let = $iter.next();
+                continue;
+            } else {
+                break;
+            }
+        }
+    };
+}
+
+/// A compilation unit
+#[derive(Clone, Debug)]
+pub struct CompilationUnit {
+    file_path: Box<Path>,
+}
+
+impl CompilationUnit {
+    fn from_file(file: &Path) -> Result<Self> {
+        let mut p = PathBuf::new();
+        p.push(file);
+        Ok(Self {
+            file_path: p.into_boxed_path(),
+        })
+    }
+    /// String representation of the computational unit
+    pub fn to_str(&self) -> Option<&str> {
+        self.file_path.to_str()
+    }
+    /// Returns the path of the file for this
+    pub fn file_path(&self) -> &Path {
+        &self.file_path
+    }
+}
+impl PartialEq for CompilationUnit {
+    fn eq(&self, other: &Self) -> bool {
+        self.file_path == other.file_path
+    }
+}
+
+impl fmt::Display for CompilationUnit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.file_path.to_string_lossy())
+    }
+}
+
+/// Tracks set of included files in a given logical compilation unit
+pub struct IncludeStack {
+    elements: Vec<CompilationUnit>,
+    pub(crate) cus: Vec<CompilationUnit>,
+}
+impl Default for IncludeStack {
+    fn default() -> Self {
+        Self {
+            elements: Vec::new(),
+            cus: Vec::new(),
+        }
+    }
+}
+
+impl IncludeStack {
+    fn pop(&mut self) {
+        self.elements.pop();
+    }
+
+    /// Returns set of compilation units
+    pub fn into_cus(self) -> Vec<CompilationUnit> {
+        self.cus
+    }
+
+    /// Pushes a a compilation unit onto the include stack
+    pub fn push<S: AsRef<OsStr> + ?Sized>(&mut self, file: &S) -> Result<usize> {
+        let e = CompilationUnit::from_file(Path::new(file))?;
+        if self.contains(&e) {
+            Err(format!(
+                "Cyclic dependency detected: {} -> {}",
+                self.elements
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<String>>()
+                    .join(" -> "),
+                e.to_string()
+            )
+            .into())
+        } else {
+            let cu = self.cus.len();
+            self.cus.push(e.clone());
+            self.elements.push(e);
+            Ok(cu)
+        }
+    }
+    fn contains(&self, e: &CompilationUnit) -> bool {
+        self.elements.contains(e)
+    }
+}
+
+impl<'input> Preprocessor {
+    pub(crate) fn resolve(
+        module_path: &ModulePath,
+        use_span: Span,
+        span2: Span,
+        rel_module_path: &Path,
+        include_stack: &mut IncludeStack,
+    ) -> Result<(usize, Box<Path>)> {
+        let mut file = PathBuf::from(rel_module_path);
+        file.set_extension("tremor");
+        // FIXME consider raw JSON: let json = Path::new(format!("{}.json", rel_module_path));
+
+        if let Some(path) = module_path.resolve(&file) {
+            if path.is_file() {
+                let cu = include_stack.push(path.as_os_str())?;
+                return Ok((cu, path));
+            }
+        }
+        file.set_extension("trickle");
+
+        if let Some(path) = module_path.resolve(&file) {
+            if path.is_file() {
+                let cu = include_stack.push(path.as_os_str())?;
+                return Ok((cu, path));
+            }
+        }
+
+        Err(ErrorKind::ModuleNotFound(
+            Range::from((use_span.start, use_span.end)).expand_lines(2),
+            Range::from((span2.start, span2.end)),
+            rel_module_path.to_string_lossy().to_string(),
+            module_path.mounts.clone(),
+        )
+        .into())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    /// Preprocess a possibly nested set of related sources into a single compilation unit
+    pub fn preprocess<S: AsRef<OsStr> + ?Sized>(
+        module_path: &ModulePath,
+        file_name: &S,
+        input: &'input mut std::string::String,
+        cu: usize,
+        include_stack: &mut IncludeStack,
+    ) -> Result<Vec<Result<TokenSpan<'input>>>> {
+        let file_name = Path::new(file_name);
+
+        input.push_str(" ");
+
+        let top = input.clone();
+        let lexemes: Vec<Result<TokenSpan>> = Tokenizer::new(top.as_str()).collect();
+        input.clear();
+
+        let mut iter = lexemes.into_iter();
+
+        let mut next;
+        loop {
+            next = iter.next();
+            match next {
+                //
+                // use <module_path> [as <alias>] ;
+                //
+                Some(Ok(Spanned {
+                    value: Token::Use,
+                    span: use_span,
+                    ..
+                })) => {
+                    let mut rel_module_path = PathBuf::new();
+                    let mut alias = String::from("<NOMODULE>");
+                    take_while!(next, Token::Whitespace(_), iter);
+
+                    if let Some(Ok(Spanned {
+                        value: Token::Ident(ref id, _),
+                        ..
+                    })) = &next
+                    {
+                        let id_str: &str = &id;
+                        rel_module_path.push(id_str);
+                        alias = id.to_string();
+
+                        take_while!(next, Token::Whitespace(_), iter);
+
+                        loop {
+                            if let Some(Ok(Spanned {
+                                value: Token::ColonColon,
+                                ..
+                            })) = next
+                            {
+                                // module path of the form:
+                                // <ident> [ :: <ident> ]*;
+                                //
+                                take_while!(next, Token::Whitespace(_), iter);
+
+                                if let Some(Ok(Spanned { ref value, .. })) = next {
+                                    if let Token::Ident(id, ..) = &value {
+                                        rel_module_path.push(&format!("{}", &id));
+                                        alias = id.to_string();
+                                        take_while!(next, Token::Whitespace(_), iter);
+
+                                        if let Some(Ok(Spanned {
+                                            ref value, span, ..
+                                        })) = next
+                                        {
+                                            match value {
+                                                Token::As => (),
+                                                Token::ColonColon => continue,
+                                                Token::Semi => break,
+                                                bad_token => {
+                                                    return Err(ErrorKind::UnrecognizedToken(
+                                                        Range::from((span.start, span.end))
+                                                            .expand_lines(2),
+                                                        Range::from((span.start, span.end)),
+                                                        bad_token.to_string(),
+                                                        vec![
+                                                            "`as`".to_string(),
+                                                            "`::`".to_string(),
+                                                            "`;`".to_string(),
+                                                        ],
+                                                    )
+                                                    .into());
+                                                }
+                                            }
+                                        }
+                                    } else if let Some(Ok(Spanned {
+                                        value: Token::As, ..
+                                    })) = next
+                                    {
+                                        if let Some(Ok(Spanned {
+                                            value: bad_token,
+                                            span,
+                                            ..
+                                        })) = next
+                                        {
+                                            return Err(ErrorKind::UnrecognizedToken(
+                                                Range::from((span.start, span.end)).expand_lines(2),
+                                                Range::from((span.start, span.end)),
+                                                bad_token.to_string(),
+                                                vec!["`<ident>`".to_string()],
+                                            )
+                                            .into());
+                                        }
+                                    } else if let Some(Ok(Spanned {
+                                        value: Token::Semi, ..
+                                    })) = next
+                                    {
+                                        break;
+                                    } else {
+                                        // We expect either ';' or 'as'
+                                        // At this point we have a parse error / bad token
+                                        //
+                                        match next {
+                                            Some(Ok(Spanned { value, span, .. })) => {
+                                                let bad_token = value;
+                                                return Err(ErrorKind::UnrecognizedToken(
+                                                    Range::from((span.start, span.end))
+                                                        .expand_lines(2),
+                                                    Range::from((span.start, span.end)),
+                                                    bad_token.to_string(),
+                                                    vec!["`<ident>`".to_string()],
+                                                )
+                                                .into());
+                                            }
+                                            Some(Err(e)) => {
+                                                return Err(e);
+                                            }
+                                            None => {
+                                                return Err(ErrorKind::UnexpectedEndOfStream.into());
+                                            }
+                                        }
+                                    }
+                                } else if let Some(Ok(Spanned { span, value })) = next {
+                                    let bad_token = value;
+                                    return Err(ErrorKind::UnrecognizedToken(
+                                        Range::from((span.start, span.end)).expand_lines(2),
+                                        Range::from((span.start, span.end)),
+                                        bad_token.to_string(),
+                                        vec!["<ident>".to_string()],
+                                    )
+                                    .into());
+                                } else if let Some(Err(e)) = next {
+                                    // Capture lexical errors from the initial lexing phase and bubble back directly
+                                    //
+                                    return Err(e);
+                                }
+                            } else if let Some(Ok(Spanned {
+                                value: Token::As, ..
+                            })) = next
+                            {
+                                break;
+                            } else if let Some(Ok(Spanned {
+                                value: Token::Semi, ..
+                            })) = next
+                            {
+                                break;
+                            } else if let Some(Ok(Spanned {
+                                value: bad_token,
+                                span,
+                                ..
+                            })) = next
+                            {
+                                return Err(ErrorKind::UnrecognizedToken(
+                                    Range::from((span.start, span.end)).expand_lines(2),
+                                    Range::from((span.start, span.end)),
+                                    bad_token.to_string(),
+                                    vec!["::".to_string(), "as".to_string(), ";".to_string()],
+                                )
+                                .into());
+                            }
+                        }
+
+                        //
+                        // As <alias:ident>
+                        //
+
+                        if let Some(Ok(Spanned {
+                            value: Token::As, ..
+                        })) = next
+                        {
+                            take_while!(next, Token::Whitespace(_), iter);
+                            if let Some(Ok(Spanned {
+                                value: Token::Ident(alias_id, ..),
+                                ..
+                            })) = &next
+                            {
+                                alias = alias_id.to_string();
+                            } else if let Some(Ok(Spanned {
+                                value: bad_token,
+                                span,
+                                ..
+                            })) = next
+                            {
+                                return Err(ErrorKind::UnrecognizedToken(
+                                    Range::from((span.start, span.end)).expand_lines(2),
+                                    Range::from((span.start, span.end)),
+                                    bad_token.to_string(),
+                                    vec!["`<ident>`".to_string()],
+                                )
+                                .into());
+                            }
+
+                            // ';'
+                            take_while!(next, Token::Whitespace(_), iter);
+
+                            // Semi
+                            take_while!(next, Token::Whitespace(_), iter);
+                        }
+                    } else if let Some(Ok(Spanned {
+                        ref value, span, ..
+                    })) = next
+                    {
+                        return Err(ErrorKind::UnrecognizedToken(
+                            Range::from((span.start, span.end)).expand_lines(2),
+                            Range::from((span.start, span.end)),
+                            value.to_string(),
+                            vec!["`<ident>`".to_string()],
+                        )
+                        .into());
+                    }
+
+                    if let Some(Ok(Spanned {
+                        value: Token::Semi, ..
+                    })) = next
+                    {
+                        take_while!(next, Token::Whitespace(_), iter);
+                    }
+
+                    if let Some(Ok(Spanned {
+                        value: Token::NewLine,
+                        span: span2,
+                        ..
+                    })) = next
+                    {
+                        //let file_path = rel_module_path.clone();
+                        let (inner_cu, file_path) = Preprocessor::resolve(
+                            module_path,
+                            use_span,
+                            span2,
+                            &rel_module_path,
+                            include_stack,
+                        )?;
+                        let file_path2 = file_path.clone();
+
+                        match fs::File::open(&file_path) {
+                            Ok(mut file) => {
+                                let mut s = String::new();
+                                file.read_to_string(&mut s)?;
+
+                                s.push(' ');
+                                let s = Preprocessor::preprocess(
+                                    &module_path,
+                                    file_path.as_os_str(),
+                                    &mut s,
+                                    inner_cu,
+                                    include_stack,
+                                )?;
+                                let y = s
+                                    .into_iter()
+                                    .filter_map(|x| x.map(|x| format!("{}", x.value)).ok())
+                                    .collect::<Vec<String>>()
+                                    .join("");
+                                input.push_str(&format!(
+                                    "#!line 0 0 0 {} {}\n",
+                                    inner_cu,
+                                    &file_path2.to_string_lossy()
+                                ));
+                                input.push_str(&format!("mod {} with\n", &alias));
+                                input.push_str(&format!(
+                                    "#!line 0 0 0 {} {}\n",
+                                    inner_cu,
+                                    &file_path2.to_string_lossy()
+                                ));
+                                input.push_str(&format!("{}\n", y.trim()));
+                                input.push_str("end;\n");
+                                input.push_str(&format!(
+                                    "#!line {} {} {} {} {}\n",
+                                    span2.end.absolute,
+                                    span2.end.line + 1,
+                                    0,
+                                    cu,
+                                    file_name.to_string_lossy(),
+                                ));
+                            }
+                            Err(e) => {
+                                return Err(e.into());
+                            }
+                        }
+                        include_stack.pop();
+                    } else if let Some(Ok(Spanned {
+                        value: bad_token,
+                        span,
+                        ..
+                    })) = next
+                    {
+                        return Err(ErrorKind::UnrecognizedToken(
+                            Range::from((span.start, span.end)).expand_lines(2),
+                            Range::from((span.start, span.end)),
+                            bad_token.to_string(),
+                            vec!["<ident>".to_string()],
+                        )
+                        .into());
+                    }
+                }
+                Some(Ok(other)) => {
+                    input.push_str(&format!("{}", other.value));
+                }
+                Some(Err(e)) => {
+                    return Err(e);
+                }
+                None => break,
+            }
+        }
+
+        input.push_str(" ");
+        let tokens = Tokenizer::new(input).collect();
+
+        Ok(tokens)
+    }
+}
+
 /// An iterator over a source string that yeilds `Token`s for subsequent use by
 /// the parser
 pub struct Lexer<'input> {
     input: &'input str,
     chars: CharLocations<'input>,
     start_index: BytePos,
+    file_offset: Location,
+    cu: usize,
     stored_tokens: VecDeque<TokenSpan<'input>>,
 }
 
 type Lexeme = Option<(Location, char)>;
 
 impl<'input> Lexer<'input> {
+    pub(crate) fn spanned2<T>(
+        &self,
+        mut start: Location,
+        mut end: Location,
+        value: T,
+    ) -> Spanned<T> {
+        start.unit_id = self.cu;
+        end.unit_id = self.cu;
+        Spanned {
+            span: span(start - self.file_offset, end - self.file_offset),
+            value,
+        }
+    }
+
     /// Create a new lexer from the source string
     pub(crate) fn new<S>(input: &'input S) -> Self
     where
@@ -714,6 +1244,8 @@ impl<'input> Lexer<'input> {
             input: input.src(),
             chars,
             start_index: input.start_index(),
+            file_offset: Location::default(),
+            cu: 0,
             stored_tokens: VecDeque::new(),
         }
     }
@@ -722,6 +1254,25 @@ impl<'input> Lexer<'input> {
     fn lookahead(&mut self) -> Lexeme {
         let loc = self.chars.location;
         self.chars.chars.peek().map(|b| (loc, *b))
+    }
+
+    fn starts_with(&mut self, start: Location, s: &str) -> Option<(Location, &'input str)> {
+        let mut end = start;
+        end.column += s.bytes().len();
+        end.absolute += s.bytes().len();
+
+        if let Some(head) = self.slice(start, end) {
+            if head == s {
+                for _ in 0..s.len() - 1 {
+                    self.bump();
+                }
+                Some((end, head))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     }
 
     fn bump(&mut self) -> Lexeme {
@@ -777,13 +1328,45 @@ impl<'input> Lexer<'input> {
     }
 
     fn cx(&mut self, start: Location) -> Result<TokenSpan<'input>> {
-        let (end, lexeme) = self.take_until(start, |ch| ch == '\n');
-
-        if lexeme.starts_with("##") {
-            let doc = Token::DocComment(&lexeme[2..]);
-            Ok(spanned2(start, end, doc))
+        if let Some((end, _)) = self.starts_with(start, "#!config ") {
+            Ok(self.spanned2(start, end, Token::ConfigDirective))
         } else {
-            Ok(spanned2(start, end, Token::SingleLineComment(&lexeme[1..])))
+            let (end, lexeme) = self.take_until(start, |ch| ch == '\n');
+
+            if lexeme.starts_with("###") {
+                let doc = Token::ModComment(&lexeme[3..]);
+                Ok(self.spanned2(start, end, doc))
+            } else if lexeme.starts_with("##") {
+                let doc = Token::DocComment(&lexeme[2..]);
+                Ok(self.spanned2(start, end, doc))
+            } else if lexeme.starts_with("#!line") {
+                let directive = &lexeme[6..];
+
+                let directive = directive.trim();
+                let splitted: Vec<_> = directive.split(' ').collect();
+
+                if let Some(&[absolute, line, column, cu, file]) = splitted.get(0..5) {
+                    let cu = cu.parse()?;
+                    let mut l = Location {
+                        unit_id: cu,
+                        line: line.parse()?,
+                        column: column.parse()?,
+                        absolute: absolute.parse()?,
+                    };
+                    l.line -= l.line.saturating_sub(1);
+                    let line_directive = Token::LineDirective(l, file.into());
+
+                    let mut l = start - l;
+                    l.column = 0;
+                    self.file_offset = l;
+                    self.cu = cu;
+                    Ok(self.spanned2(start, end, line_directive))
+                } else {
+                    Err("Snot!".into())
+                }
+            } else {
+                Ok(self.spanned2(start, end, Token::SingleLineComment(&lexeme[1..])))
+            }
         }
     }
 
@@ -791,13 +1374,13 @@ impl<'input> Lexer<'input> {
         match self.lookahead() {
             Some((end, '>')) => {
                 self.bump();
-                Ok(spanned2(start, end, Token::EqArrow))
+                Ok(self.spanned2(start, end, Token::EqArrow))
             }
             Some((end, '=')) => {
                 self.bump();
-                Ok(spanned2(start, end, Token::EqEq))
+                Ok(self.spanned2(start, end, Token::EqEq))
             }
-            _ => Ok(spanned2(start, start, Token::Eq)),
+            _ => Ok(self.spanned2(start, start, Token::Eq)),
         }
     }
 
@@ -805,9 +1388,9 @@ impl<'input> Lexer<'input> {
         let (end, lexeme) = self.take_while(start, |ch| ch == ':');
 
         match lexeme {
-            "::" => Ok(spanned2(start, end, Token::ColonColon)),
-            ":" => Ok(spanned2(start, end, Token::Colon)),
-            _ => Ok(spanned2(start, end, Token::Bad(lexeme.to_string()))),
+            "::" => Ok(self.spanned2(start, end, Token::ColonColon)),
+            ":" => Ok(self.spanned2(start, end, Token::Colon)),
+            _ => Ok(self.spanned2(start, end, Token::Bad(lexeme.to_string()))),
         }
     }
 
@@ -815,8 +1398,8 @@ impl<'input> Lexer<'input> {
         let (end, lexeme) = self.take_while(start, |ch| ch == '-');
 
         match lexeme {
-            "-" => Ok(spanned2(start, end, Token::Sub)),
-            _ => Ok(spanned2(start, end, Token::Bad(lexeme.to_string()))),
+            "-" => Ok(self.spanned2(start, end, Token::Sub)),
+            _ => Ok(self.spanned2(start, end, Token::Bad(lexeme.to_string()))),
         }
     }
 
@@ -826,14 +1409,14 @@ impl<'input> Lexer<'input> {
         });
 
         match lexeme {
-            "<" => Ok(spanned2(start, end, Token::Lt)),
-            "<=" => Ok(spanned2(start, end, Token::Lte)),
-            ">" => Ok(spanned2(start, end, Token::Gt)),
-            ">=" => Ok(spanned2(start, end, Token::Gte)),
-            "<<" => Ok(spanned2(start, end, Token::LBitShift)),
-            ">>" => Ok(spanned2(start, end, Token::RBitShiftSigned)),
-            ">>>" => Ok(spanned2(start, end, Token::RBitShiftUnsigned)),
-            _ => Ok(spanned2(start, end, Token::Bad(lexeme.to_string()))),
+            "<" => Ok(self.spanned2(start, end, Token::Lt)),
+            "<=" => Ok(self.spanned2(start, end, Token::Lte)),
+            ">" => Ok(self.spanned2(start, end, Token::Gt)),
+            ">=" => Ok(self.spanned2(start, end, Token::Gte)),
+            "<<" => Ok(self.spanned2(start, end, Token::LBitShift)),
+            ">>" => Ok(self.spanned2(start, end, Token::RBitShiftSigned)),
+            ">>>" => Ok(self.spanned2(start, end, Token::RBitShiftUnsigned)),
+            _ => Ok(self.spanned2(start, end, Token::Bad(lexeme.to_string()))),
         }
     }
 
@@ -841,13 +1424,17 @@ impl<'input> Lexer<'input> {
         match self.lookahead() {
             Some((end, '[')) => {
                 self.bump();
-                Ok(spanned2(start, end, Token::LPatBracket))
+                Ok(self.spanned2(start, end, Token::LPatBracket))
+            }
+            Some((end, '(')) => {
+                self.bump();
+                Ok(self.spanned2(start, end, Token::LPatParen))
             }
             Some((end, '{')) => {
                 self.bump();
-                Ok(spanned2(start, end, Token::LPatBrace))
+                Ok(self.spanned2(start, end, Token::LPatBrace))
             }
-            Some((end, _)) => Ok(spanned2(start, end, Token::Mod)),
+            Some((end, _)) => Ok(self.spanned2(start, end, Token::Mod)),
             None => Err(ErrorKind::UnexpectedEndOfStream.into()),
         }
     }
@@ -856,9 +1443,9 @@ impl<'input> Lexer<'input> {
         match self.lookahead() {
             Some((end, '=')) => {
                 self.bump();
-                Ok(spanned2(start, end, Token::NotEq))
+                Ok(self.spanned2(start, end, Token::NotEq))
             }
-            Some((end, ch)) => Ok(spanned2(start, end, Token::Bad(format!("!{}", ch)))),
+            Some((end, ch)) => Ok(self.spanned2(start, end, Token::Bad(format!("!{}", ch)))),
             None => Err(ErrorKind::UnexpectedEndOfStream.into()),
         }
     }
@@ -867,9 +1454,9 @@ impl<'input> Lexer<'input> {
         match self.lookahead() {
             Some((end, '=')) => {
                 self.bump();
-                Ok(spanned2(start, end, Token::TildeEq))
+                Ok(self.spanned2(start, end, Token::TildeEq))
             }
-            Some((end, _)) => Ok(spanned2(start, end, Token::Tilde)),
+            Some((end, _)) => Ok(self.spanned2(start, end, Token::Tilde)),
             None => Err(ErrorKind::UnexpectedEndOfStream.into()),
         }
     }
@@ -878,6 +1465,8 @@ impl<'input> Lexer<'input> {
         let (end, ident) = self.take_while(start, is_ident_continue);
 
         let token = match ident {
+            "intrinsic" => Token::Intrinsic,
+            "mod" => Token::Module,
             "const" => Token::Const,
             "let" => Token::Let,
             "match" => Token::Match,
@@ -929,10 +1518,13 @@ impl<'input> Lexer<'input> {
             "each" => Token::Each,
             "define" => Token::Define,
             "args" => Token::Args,
+            "use" => Token::Use,
+            "as" => Token::As,
+            "recur" => Token::Recur,
             src => Token::Ident(src.into(), false),
         };
 
-        Ok(spanned2(start, end, token))
+        Ok(self.spanned2(start, end, token))
     }
 
     fn next_index(&mut self) -> Result<Location> {
@@ -1011,11 +1603,11 @@ impl<'input> Lexer<'input> {
                     end.absolute += 1;
                     if let Some(slice) = self.slice(s, e) {
                         let token = Token::Ident(slice.into(), true);
-                        return Ok(spanned2(start, end, token));
+                        return Ok(self.spanned2(start, end, token));
                     } else {
                         // Invalid start end case :(
                         let token = Token::Ident(string.into(), true);
-                        return Ok(spanned2(start, end, token));
+                        return Ok(self.spanned2(start, end, token));
                     }
                 }
                 Some((end, '\n')) => {
@@ -1048,7 +1640,7 @@ impl<'input> Lexer<'input> {
         let mut end = start;
         end.column += 1;
         end.absolute += 1;
-        let q1 = spanned2(start, end, Token::DQuote);
+        let q1 = self.spanned2(start, end, Token::DQuote);
         let mut res = vec![q1];
         let string = String::new();
 
@@ -1082,7 +1674,7 @@ impl<'input> Lexer<'input> {
                     let start = end;
                     end.column += 1;
                     end.absolute += 1;
-                    res.push(spanned2(start, end, Token::DQuote));
+                    res.push(self.spanned2(start, end, Token::DQuote));
                     Ok(res)
                 }
             }
@@ -1119,7 +1711,7 @@ impl<'input> Lexer<'input> {
                         let token = Token::HereDoc(indent, strings);
                         end.column += 1;
                         end.absolute += 1;
-                        return Ok(spanned2(start, end, token));
+                        return Ok(self.spanned2(start, end, token));
                     }
                 }
                 None => {
@@ -1171,12 +1763,12 @@ impl<'input> Lexer<'input> {
                             // Invalid start end case :(
                             Token::StringLiteral(string.into())
                         };
-                        res.push(spanned2(start, end, token));
+                        res.push(self.spanned2(start, end, token));
                     }
                     let start = end;
                     end.column += 1;
                     end.absolute += 1;
-                    res.push(spanned2(start, end, Token::DQuote));
+                    res.push(self.spanned2(start, end, Token::DQuote));
                     return Ok(res);
                 }
                 Some((end_inner, '{')) => {
@@ -1199,14 +1791,14 @@ impl<'input> Lexer<'input> {
                             // Invalid start end case :(
                             Token::StringLiteral(string.into())
                         };
-                        res.push(spanned2(start, end_inner, token));
+                        res.push(self.spanned2(start, end_inner, token));
                         string = String::new();
                     }
                     start = end_inner;
                     end = end_inner;
                     end.column += 1;
                     end.absolute += 1;
-                    res.push(spanned2(start, end, Token::LBrace));
+                    res.push(self.spanned2(start, end, Token::LBrace));
                     let mut pcount = 0;
                     // We can't use for because of the borrow checker ...
                     #[allow(clippy::while_let_on_iterator)]
@@ -1303,7 +1895,7 @@ impl<'input> Lexer<'input> {
                         })
                         .collect();
                     let token = Token::TestLiteral(indent, strings);
-                    return Ok(spanned2(start, end, token));
+                    return Ok(self.spanned2(start, end, token));
                 }
                 Some((end, '\n')) => {
                     return Err(ErrorKind::UnterminatedExtractor(
@@ -1447,13 +2039,13 @@ impl<'input> Lexer<'input> {
             }
         };
 
-        Ok(spanned2(start, end, token))
+        Ok(self.spanned2(start, end, token))
     }
 
     /// Consume whitespace
     fn ws(&mut self, start: Location) -> Result<TokenSpan<'input>> {
         let (end, src) = self.take_while(start, is_ws);
-        Ok(spanned2(start, end, Token::Whitespace(src)))
+        Ok(self.spanned2(start, end, Token::Whitespace(src)))
     }
 }
 
@@ -1484,28 +2076,28 @@ impl<'input> Iterator for Lexer<'input> {
             None => None,
             Some((start, ch)) => {
                 match ch as char {
-                    // '...' =>  Some(Ok(spanned2(start, self.next_index(), Token::DotDotDot))),
-                    // ".." =>  Some(Ok(spanned2(start, self.next_index(), Token::DotDot))),
-                    ',' => Some(Ok(spanned2(start, start, Token::Comma))),
-                    '$' => Some(Ok(spanned2(start, start, Token::Dollar))),
-                    '.' => Some(Ok(spanned2(start, start, Token::Dot))),
-                    //                        '?' => Some(Ok(spanned2(start, start, Token::Question))),
-                    //'_' => Some(Ok(spanned2(start, start, Token::DontCare))),
-                    ';' => Some(Ok(spanned2(start, start, Token::Semi))),
-                    '+' => Some(Ok(spanned2(start, start, Token::Add))),
-                    '*' => Some(Ok(spanned2(start, start, Token::Mul))),
-                    '\\' => Some(Ok(spanned2(start, start, Token::BSlash))),
-                    '(' => Some(Ok(spanned2(start, start, Token::LParen))),
-                    ')' => Some(Ok(spanned2(start, inc_loc(start), Token::RParen))),
-                    '{' => Some(Ok(spanned2(start, start, Token::LBrace))),
-                    '}' => Some(Ok(spanned2(start, inc_loc(start), Token::RBrace))),
-                    '[' => Some(Ok(spanned2(start, start, Token::LBracket))),
-                    ']' => Some(Ok(spanned2(start, inc_loc(start), Token::RBracket))),
-                    '/' => Some(Ok(spanned2(start, start, Token::Div))),
+                    // '...' =>  Some(Ok(self.spanned2(start, self.next_index(), Token::DotDotDot))),
+                    // ".." =>  Some(Ok(self.spanned2(start, self.next_index(), Token::DotDot))),
+                    ',' => Some(Ok(self.spanned2(start, start, Token::Comma))),
+                    '$' => Some(Ok(self.spanned2(start, start, Token::Dollar))),
+                    '.' => Some(Ok(self.spanned2(start, start, Token::Dot))),
+                    //                        '?' => Some(Ok(self.spanned2(start, start, Token::Question))),
+                    '_' => Some(Ok(self.spanned2(start, start, Token::DontCare))),
+                    ';' => Some(Ok(self.spanned2(start, start, Token::Semi))),
+                    '+' => Some(Ok(self.spanned2(start, start, Token::Add))),
+                    '*' => Some(Ok(self.spanned2(start, start, Token::Mul))),
+                    '\\' => Some(Ok(self.spanned2(start, start, Token::BSlash))),
+                    '(' => Some(Ok(self.spanned2(start, start, Token::LParen))),
+                    ')' => Some(Ok(self.spanned2(start, inc_loc(start), Token::RParen))),
+                    '{' => Some(Ok(self.spanned2(start, start, Token::LBrace))),
+                    '}' => Some(Ok(self.spanned2(start, inc_loc(start), Token::RBrace))),
+                    '[' => Some(Ok(self.spanned2(start, start, Token::LBracket))),
+                    ']' => Some(Ok(self.spanned2(start, inc_loc(start), Token::RBracket))),
+                    '/' => Some(Ok(self.spanned2(start, start, Token::Div))),
                     // TODO account for extractors which use | to mark format boundaries
-                    //'|' => Some(Ok(spanned2(start, start, Token::BitOr))),
-                    '^' => Some(Ok(spanned2(start, start, Token::BitXor))),
-                    '&' => Some(Ok(spanned2(start, start, Token::BitAnd))),
+                    //'|' => Some(Ok(self.spanned2(start, start, Token::BitOr))),
+                    '^' => Some(Ok(self.spanned2(start, start, Token::BitXor))),
+                    '&' => Some(Ok(self.spanned2(start, start, Token::BitAnd))),
                     ':' => Some(self.cn(start)),
                     '-' => Some(self.sb(start)),
                     '#' => Some(self.cx(start)),
@@ -1516,7 +2108,7 @@ impl<'input> Iterator for Lexer<'input> {
                     '`' => Some(self.id2(start)),
                     // TODO account for bitwise not operator
                     '!' => Some(self.pe(start)),
-                    '\n' => Some(Ok(spanned2(start, start, Token::NewLine))),
+                    '\n' => Some(Ok(self.spanned2(start, start, Token::NewLine))),
                     ch if is_ident_start(ch) => Some(self.id(start)),
                     '"' => match self.qs_or_hd(start) {
                         Ok(mut tokens) => {
@@ -1532,7 +2124,7 @@ impl<'input> Iterator for Lexer<'input> {
                     ch if ch.is_whitespace() => Some(self.ws(start)),
                     _ => {
                         let str = format!("{}", ch);
-                        Some(Ok(spanned2(start, start, Token::Bad(str))))
+                        Some(Ok(self.spanned2(start, start, Token::Bad(str))))
                     }
                 }
             }
@@ -1580,7 +2172,7 @@ mod tests {
     }
 
     #[test]
-    fn interpolat() {
+    fn interpolat() -> Result<()> {
         lex_ok! {
             r#"  "" "#,
             r#"  ~ "# => Token::DQuote,
@@ -1626,29 +2218,31 @@ mod tests {
             r#"                        ~ "# => Token::RBrace,
             r#"                         ~ "# => Token::DQuote,
         };
+        Ok(())
     }
     #[test]
-    fn paths() {
+    fn paths() -> Result<()> {
         lex_ok! {
             "  hello-hahaha8ABC ",
             "  ~~~~~~~~~~~~~~~~ " => Token::Ident("hello-hahaha8ABC".into(), false),
         };
         lex_ok! {
             "  .florp ", "  ~ " => Token::Dot, "   ~~~~~ " => Token::Ident("florp".into(), false),
-        }
+        };
         lex_ok! {
             "  $borp ", "  ~ " => Token::Dollar, "   ~~~~~ " => Token::Ident("borp".into(), false),
-        }
+        };
         lex_ok! {
             "  $`borp`", "  ~ " => Token::Dollar, "   ~~~~~~~ " => Token::Ident("borp".into(), true),
-        }
+        };
+        Ok(())
     }
 
     #[test]
     fn ignorable() {}
 
     #[test]
-    fn keywords() {
+    fn keywords() -> Result<()> {
         lex_ok! { " let ", " ~~~~~~ " => Token::Let, };
         lex_ok! { " match ", " ~~~~~~ " => Token::Match, };
         lex_ok! { " case ", " ~~~~~~ " => Token::Case, };
@@ -1660,10 +2254,12 @@ mod tests {
         lex_ok! { " state ", " ~~~~~~ " => Token::State, };
         lex_ok! { " set ", " ~~~~~~ " => Token::Set, };
         lex_ok! { " each ", " ~~~~~~ " => Token::Each, };
+        lex_ok! { " intrinsic ", " ~~~~~~~~~ " => Token::Intrinsic, };
+        Ok(())
     }
 
     #[test]
-    fn operators() {
+    fn operators() -> Result<()> {
         lex_ok! {
         " not null ", "  ~ " => Token::Not, "  ~ " => Token::Nil, };
         lex_ok! { " != null ", "  ~~ " => Token::NotEq, "   ~ " => Token::Nil, };
@@ -1692,10 +2288,11 @@ mod tests {
         lex_ok! { " * ", " ~ " => Token::Mul, };
         lex_ok! { " / ", " ~ " => Token::Div, };
         lex_ok! { " % ", " ~ " => Token::Mod, };
+        Ok(())
     }
 
     #[test]
-    fn should_disambiguate() {
+    fn should_disambiguate() -> Result<()> {
         // Starts with ':'
         lex_ok! { " : ", " ~ " => Token::Colon, };
         lex_ok! { " :: ", " ~~ " => Token::ColonColon, };
@@ -1711,13 +2308,16 @@ mod tests {
         // Starts with '%'
         lex_ok! { " % ", " ~ " => Token::Mod, }
         lex_ok! { " %{ ", " ~~ " => Token::LPatBrace, }
-
+        lex_ok! { " %[ ", " ~~ " => Token::LPatBracket, }
+        lex_ok! { " %( ", " ~~ " => Token::LPatParen, }
         // Starts with '.'
-        lex_ok! { " . ", " ~ " => Token::Dot, }
+        lex_ok! { " . ", " ~ " => Token::Dot, };
+
+        Ok(())
     }
 
     #[test]
-    fn delimiters() {
+    fn delimiters() -> Result<()> {
         lex_ok! {
                     " ( ) { } [ ] ",
                     " ~           " => Token::LParen,
@@ -1726,55 +2326,56 @@ mod tests {
                     "       ~     " => Token::RBrace,
                     "         ~   " => Token::LBracket,
                     "           ~ " => Token::RBracket,
-        }
+        };
+        Ok(())
     }
 
     #[test]
-    fn string() {
+    fn string() -> Result<()> {
         lex_ok! {
             r#" "\n" "#,
             r#" ~    "# => Token::DQuote,
             r#"  ~~  "# => Token::StringLiteral("\n".into()),
             r#"    ~ "# => Token::DQuote,
-        }
+        };
         lex_ok! {
             r#" "\r" "#,
             r#" ~    "# => Token::DQuote,
             r#"  ~~  "# => Token::StringLiteral("\r".into()),
             r#"    ~ "# => Token::DQuote,
-        }
+        };
         lex_ok! {
             r#" "\t" "#,
             r#" ~    "# => Token::DQuote,
             r#"  ~~  "# => Token::StringLiteral("\t".into()),
             r#"    ~ "# => Token::DQuote,
-        }
+        };
         lex_ok! {
              r#" "\\" "#,
              r#" ~    "# => Token::DQuote,
              r#"  ~~  "# => Token::StringLiteral("\\".into()),
              r#"    ~ "# => Token::DQuote,
-        }
+        };
         lex_ok! {
             r#" "\"" "#,
             r#" ~    "# => Token::DQuote,
             r#"  ~~  "# => Token::StringLiteral("\"".into()),
             r#"    ~ "# => Token::DQuote,
-        }
+        };
 
         lex_ok! {
             r#" "\"\"" "#,
             r#" ~    "# => Token::DQuote,
             r#"  ~~  "# => Token::StringLiteral("\"\"".into()),
             r#"    ~ "# => Token::DQuote,
-        }
+        };
 
         lex_ok! {
             r#" "\\\"" "#,
             r#" ~    "# => Token::DQuote,
             r#"  ~~  "# => Token::StringLiteral("\\\"".into()),
             r#"    ~ "# => Token::DQuote,
-        }
+        };
 
         lex_ok! {
             r#" "\"\"""\"\"" "#,
@@ -1784,7 +2385,56 @@ mod tests {
             r#"       ~      "# => Token::DQuote,
             r#"        ~~~~  "# => Token::StringLiteral("\"\"".into()),
             r#"            ~ "# => Token::DQuote,
-        }
+        };
         //lex_ko! { r#" "\\\" "#, " ~~~~~ " => ErrorKind::UnterminatedStringLiteral { start: Location::new(1,2,2), end: Location::new(1,7,7) } }
+        Ok(())
+    }
+
+    #[test]
+    fn test_preprocessor() -> Result<()> {
+        lex_ok! {
+            r#"use "foo.tremor" ;"#,
+            r#"~"# => Token::Use,
+            r#"    ~"# => Token::DQuote,
+            r#"      ~"# => Token::StringLiteral("foo.tremor".into()),
+            r#"               ~"# => Token::DQuote,
+            r#"                 ~"# => Token::Semi,
+        };
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_test_literal_format_bug_regression() -> Result<()> {
+        let mut snot = "match %{ test ~= base64|| } of default => \"badger\" end ".to_string();
+        let mut snot2 = snot.clone();
+        let badger: Vec<_> = Tokenizer::new(&mut snot).collect();
+        let mut include_stack = IncludeStack::default();
+        let badger2 = Preprocessor::preprocess(
+            &ModulePath { mounts: vec![] },
+            "foo",
+            &mut snot2,
+            0,
+            &mut include_stack,
+        )?;
+        let mut res = String::new();
+        for b in badger
+            .into_iter()
+            .filter_map(Result::ok)
+            .collect::<Vec<TokenSpan>>()
+        {
+            res.push_str(&format!("{}", b.value));
+        }
+        assert_eq!(snot.trim(), res);
+        let mut res2 = String::new();
+        for b in badger2
+            .into_iter()
+            .filter_map(Result::ok)
+            .collect::<Vec<TokenSpan>>()
+        {
+            res2.push_str(&format!("{}", b.value));
+        }
+        assert_eq!(snot, res2);
+        Ok(())
     }
 }

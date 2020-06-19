@@ -12,6 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(test)]
+macro_rules! assert_val {
+    ($e:expr, $r:expr) => {
+        assert_eq!($e, Ok(Value::from($r)))
+    };
+}
+
 mod array;
 mod chash;
 mod datetime;
@@ -28,7 +35,9 @@ mod record;
 mod stats;
 mod string;
 mod system;
+mod test;
 mod r#type;
+mod url;
 mod win;
 
 use crate::registry::{Aggr as AggrRegistry, Registry};
@@ -44,12 +53,14 @@ pub fn load(registry: &mut Registry) {
     math::load(registry);
     origin::load(registry);
     random::load(registry);
+    range::load(registry);
     re::load(registry);
     record::load(registry);
     string::load(registry);
     system::load(registry);
+    test::load(registry);
     r#type::load(registry);
-    range::load(registry);
+    url::load(registry);
 }
 
 pub fn load_aggr(registry: &mut AggrRegistry) {

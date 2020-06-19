@@ -15,8 +15,8 @@
 // Don't cover this file it's only getters
 #![cfg_attr(tarpaulin, skip)]
 
-use super::raw::*;
-use super::*;
+use super::raw::{GroupBy, GroupByInt, ImutExprRaw, PathRaw, TestExprRaw};
+use super::{Expr, ImutExprInt, InvokeAggr, NodeMetas, Path, Segment, TestExpr};
 use crate::pos::{Location, Range};
 
 #[doc(hidden)]
@@ -107,6 +107,7 @@ impl<'script> BaseExpr for ImutExprInt<'script> {
             ImutExprInt::InvokeAggr(e) => e.s(meta),
             ImutExprInt::List(e) => e.s(meta),
             ImutExprInt::Literal(e) => e.s(meta),
+            ImutExprInt::Recur(e) => e.s(meta),
             ImutExprInt::Local { mid, .. } | ImutExprInt::Present { mid, .. } => {
                 meta.start(*mid).unwrap_or_default()
             }
@@ -133,6 +134,7 @@ impl<'script> BaseExpr for ImutExprInt<'script> {
             ImutExprInt::Merge(e) => e.e(meta),
             ImutExprInt::Patch(e) => e.e(meta),
             ImutExprInt::Path(e) => e.e(meta),
+            ImutExprInt::Recur(e) => e.e(meta),
             ImutExprInt::Local { mid, .. } | ImutExprInt::Present { mid, .. } => {
                 meta.end(*mid).unwrap_or_default()
             }
@@ -155,6 +157,7 @@ impl<'script> BaseExpr for ImutExprInt<'script> {
             ImutExprInt::Merge(e) => e.mid(),
             ImutExprInt::Patch(e) => e.mid(),
             ImutExprInt::Path(e) => e.mid(),
+            ImutExprInt::Recur(e) => e.mid(),
             ImutExprInt::Local { mid, .. } | ImutExprInt::Present { mid, .. } => *mid,
             ImutExprInt::Record(e) => e.mid(),
             ImutExprInt::Unary(e) => e.mid(),
@@ -182,6 +185,7 @@ impl<'script> BaseExpr for PathRaw<'script> {
     fn s(&self, meta: &NodeMetas) -> Location {
         match self {
             PathRaw::Local(e) => e.s(meta),
+            PathRaw::Const(e) => e.s(meta),
             PathRaw::Meta(e) => e.start,
             PathRaw::Event(e) => e.start,
             PathRaw::State(e) => e.start,
@@ -190,6 +194,7 @@ impl<'script> BaseExpr for PathRaw<'script> {
     fn e(&self, meta: &NodeMetas) -> Location {
         match self {
             PathRaw::Local(e) => e.e(meta),
+            PathRaw::Const(e) => e.e(meta),
             PathRaw::Meta(e) => e.end,
             PathRaw::Event(e) => e.end,
             PathRaw::State(e) => e.end,
@@ -228,7 +233,6 @@ impl<'script> BaseExpr for ImutExprRaw<'script> {
     }
     fn s(&self, meta: &NodeMetas) -> Location {
         match self {
-            ImutExprRaw::String(e) => e.start,
             ImutExprRaw::Binary(e) => e.start,
             ImutExprRaw::Comprehension(e) => e.start,
             ImutExprRaw::Invoke(e) => e.s(meta),
@@ -240,12 +244,13 @@ impl<'script> BaseExpr for ImutExprRaw<'script> {
             ImutExprRaw::Path(e) => e.s(meta),
             ImutExprRaw::Present { start, .. } => *start,
             ImutExprRaw::Record(e) => e.s(meta),
+            ImutExprRaw::Recur(e) => e.s(meta),
+            ImutExprRaw::String(e) => e.start,
             ImutExprRaw::Unary(e) => e.start,
         }
     }
     fn e(&self, meta: &NodeMetas) -> Location {
         match self {
-            ImutExprRaw::String(e) => e.end,
             ImutExprRaw::Binary(e) => e.end,
             ImutExprRaw::Comprehension(e) => e.end,
             ImutExprRaw::Invoke(e) => e.e(meta),
@@ -257,6 +262,8 @@ impl<'script> BaseExpr for ImutExprRaw<'script> {
             ImutExprRaw::Path(e) => e.e(meta),
             ImutExprRaw::Present { end, .. } => *end,
             ImutExprRaw::Record(e) => e.e(meta),
+            ImutExprRaw::Recur(e) => e.e(meta),
+            ImutExprRaw::String(e) => e.end,
             ImutExprRaw::Unary(e) => e.end,
         }
     }

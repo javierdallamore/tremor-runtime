@@ -27,16 +27,16 @@ pub struct Config {
 impl ConfigImpl for Config {}
 
 op!(EventHistoryFactory(node) {
-    if let Some(map) = &node.config {
-        let config: Config = Config::new(map)?;
-        Ok(Box::new(EventHistory {
-            config,
-            id: node.id.clone(),
-        }))
-    } else {
-        Err(ErrorKind::MissingOpConfig(node.id.to_string()).into())
+if let Some(map) = &node.config {
+    let config: Config = Config::new(map)?;
+    Ok(Box::new(EventHistory {
+        config,
+        id: node.id.clone(),
+    }))
+} else {
+    Err(ErrorKind::MissingOpConfig(node.id.to_string()).into())
 
-    }});
+}});
 
 #[derive(Debug, Clone)]
 #[allow(clippy::module_name_repetitions)]
@@ -65,7 +65,7 @@ impl Operator for EventHistory {
                 if let Some(ref mut obj) = meta.as_object_mut() {
                     obj.insert(
                         self.config.name.clone().into(),
-                        Value::Array(vec![Value::from(format!(
+                        Value::from(vec![Value::from(format!(
                             "evt: {}({})",
                             self.config.op, id
                         ))]),
@@ -94,7 +94,7 @@ impl Operator for EventHistory {
                 if let Some(ref mut obj) = meta.as_object_mut() {
                     obj.insert(
                         self.config.name.clone().into(),
-                        Value::Array(vec![Value::from(format!(
+                        Value::from(vec![Value::from(format!(
                             "sig: {}({})",
                             self.config.op, id
                         ))]),
@@ -137,7 +137,7 @@ mod test {
         assert_eq!("out", out);
         let _ = op.on_signal(&mut event);
 
-        let history = event.data.suffix().meta.get(op.config.name.as_str());
+        let history = event.data.suffix().meta().get(op.config.name.as_str());
 
         match history.and_then(Value::as_array) {
             Some(history) => {

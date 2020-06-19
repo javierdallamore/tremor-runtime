@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::errors::*;
+use crate::errors::Result;
 use crate::metrics::RampReporter;
 use crate::pipeline;
 use crate::repository::ServantId;
@@ -121,11 +121,11 @@ impl Manager {
             info!("Onramp manager started");
             loop {
                 match rx.recv().await {
-                    Some(ManagerMsg::Stop) => {
+                    Ok(ManagerMsg::Stop) => {
                         info!("Stopping onramps...");
                         break;
                     }
-                    Some(ManagerMsg::Create(
+                    Ok(ManagerMsg::Create(
                         r,
                         Create {
                             codec,
@@ -141,8 +141,8 @@ impl Manager {
                         }
                         Err(e) => error!("Creating an onramp failed: {}", e),
                     },
-                    None => {
-                        info!("Stopping onramps...");
+                    Err(e) => {
+                        info!("Stopping onramps... {}", e);
                         break;
                     }
                 }
@@ -321,7 +321,7 @@ links:
 
             std::thread::sleep(std::time::Duration::from_millis(1000));
 
-            $test();
+            $test;
 
             std::thread::sleep(std::time::Duration::from_millis(1000));
 

@@ -19,7 +19,9 @@ use std::io::prelude::*;
 use tremor_pipeline::FN_REGISTRY;
 use tremor_runtime;
 use tremor_runtime::errors::*;
+use tremor_script::errors::CompilerError;
 use tremor_script::highlighter::{Dumb, Highlighter};
+use tremor_script::path::ModulePath;
 use tremor_script::utils::*;
 use tremor_script::{AggrType, EventContext, Script};
 
@@ -30,6 +32,7 @@ macro_rules! test_cases {
             fn $file() -> Result<()> {
 
                 tremor_runtime::functions::load()?;
+                let script_dir = concat!("tests/script_runtime_errors/", stringify!($file), "/").to_string();
                 let script_file = concat!("tests/script_runtime_errors/", stringify!($file), "/script.tremor");
                 let in_file = concat!("tests/script_runtime_errors/", stringify!($file), "/in.xz");
                 let err_file = concat!("tests/script_runtime_errors/", stringify!($file), "/error.txt");
@@ -38,7 +41,9 @@ macro_rules! test_cases {
                 let mut file = File::open(script_file)?;
                 let mut contents = String::new();
                 file.read_to_string(&mut contents)?;
-                let script = Script::parse(&contents, &*FN_REGISTRY.lock()?)?;
+                let contents2 = contents.clone();
+
+                let script = Script::parse(&ModulePath { mounts: vec![script_dir, "tremor-script/lib".into()] }, script_file, contents2, &*FN_REGISTRY.lock()?).map_err(CompilerError::error)?;
 
                 println!("Loading input: {}", in_file);
                 let mut in_json = load_event_file(in_file)?;
@@ -78,6 +83,7 @@ macro_rules! ignore_cases {
             fn $file() -> Result<()> {
 
                 tremor_runtime::functions::load()?;
+                let script_dir = concat!("tests/script_runtime_errors/", stringify!($file), "/").to_string();
                 let script_file = concat!("tests/script_runtime_errors/", stringify!($file), "/script.tremor");
                 let in_file = concat!("tests/script_runtime_errors/", stringify!($file), "/in.xz");
                 let err_file = concat!("tests/script_runtime_errors/", stringify!($file), "/error.txt");
@@ -86,7 +92,9 @@ macro_rules! ignore_cases {
                 let mut file = File::open(script_file)?;
                 let mut contents = String::new();
                 file.read_to_string(&mut contents)?;
-                let script = Script::parse(&contents, &*FN_REGISTRY.lock()?)?;
+                let contents2 = contents.clone();
+
+                let script = Script::parse(&ModulePath { mounts: vec![script_dir, "tremor-script/lib".to_string()] }, script_file, contents2, &*FN_REGISTRY.lock()?).map_err(CompilerError::error)?;
 
                 println!("Loading input: {}", in_file);
                 let mut in_json = load_event_file(in_file)?;

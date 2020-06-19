@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::config::{BindingVec, Config, MappingMap, OffRampVec, OnRampVec, PipelineVec};
-use crate::errors::*;
+use crate::errors::{Error, Result};
 use crate::lifecycle::{ActivationState, ActivatorLifecycleFsm};
 use crate::registry::{Registries, ServantId};
 use crate::repository::{
@@ -29,7 +29,6 @@ use async_std::{
     task::{self, JoinHandle},
 };
 use hashbrown::HashMap;
-use tremor_pipeline;
 
 pub(crate) use crate::offramp;
 pub(crate) use crate::onramp;
@@ -81,16 +80,16 @@ impl Manager {
         let system_h = task::spawn(async move {
             loop {
                 match rx.recv().await {
-                    Some(ManagerMsg::CreatePipeline(r, c)) => {
+                    Ok(ManagerMsg::CreatePipeline(r, c)) => {
                         self.pipeline.send(pipeline::ManagerMsg::Create(r, c)).await
                     }
-                    Some(ManagerMsg::CreateOnrampt(r, c)) => {
+                    Ok(ManagerMsg::CreateOnrampt(r, c)) => {
                         self.onramp.send(onramp::ManagerMsg::Create(r, c)).await
                     }
-                    Some(ManagerMsg::CreateOfframp(r, c)) => {
+                    Ok(ManagerMsg::CreateOfframp(r, c)) => {
                         self.offramp.send(offramp::ManagerMsg::Create(r, c)).await
                     }
-                    Some(ManagerMsg::Stop) => {
+                    Ok(ManagerMsg::Stop) => {
                         info!("Stopping offramps...");
                         self.offramp.send(offramp::ManagerMsg::Stop).await;
                         info!("Stopping pipelines...");
@@ -99,8 +98,8 @@ impl Manager {
                         self.onramp.send(onramp::ManagerMsg::Stop).await;
                         break;
                     }
-                    None => {
-                        info!("Stopping onramps in an odd way...");
+                    Err(e) => {
+                        info!("Stopping onramps in an odd way... {}", e);
                         break;
                     }
                 }
@@ -653,8 +652,6 @@ type: stderr
                 pipeline::Create { id, config },
             ))
             .await;
-        rx.recv()
-            .await
-            .ok_or_else(|| Error::from(ErrorKind::AsyncRecvError))?
+        rx.recv().await?
     }
 }

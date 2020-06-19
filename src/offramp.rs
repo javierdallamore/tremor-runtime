@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::codec::Codec;
-use crate::errors::*;
+use crate::errors::Result;
 use crate::metrics::RampReporter;
 use crate::pipeline;
 use crate::registry::ServantId;
@@ -30,6 +30,7 @@ use std::thread;
 mod blackhole;
 mod debug;
 mod elastic;
+mod exit;
 mod file;
 #[cfg(feature = "gcp")]
 mod gcs;
@@ -87,6 +88,7 @@ pub fn lookup(name: &str, config: &Option<OpConfig>) -> Result<Box<dyn Offramp>>
         "blackhole" => blackhole::Blackhole::from_config(config),
         "debug" => debug::Debug::from_config(config),
         "elastic" => elastic::Elastic::from_config(config),
+        "exit" => exit::Exit::from_config(config),
         "file" => file::File::from_config(config),
         #[cfg(feature = "gcp")]
         "gcs" => gcs::GCS::from_config(config),
@@ -142,11 +144,11 @@ impl Manager {
             info!("Onramp manager started");
             loop {
                 match rx.recv().await {
-                    Some(ManagerMsg::Stop) => {
+                    Ok(ManagerMsg::Stop) => {
                         info!("Stopping onramps...");
                         break;
                     }
-                    Some(ManagerMsg::Create(
+                    Ok(ManagerMsg::Create(
                         r,
                         Create {
                             codec,
@@ -166,7 +168,6 @@ impl Manager {
 
                         let (tx, rx) = bounded(self.qsize);
                         let offramp_id = id.clone();
-                        // let mut s = req;
                         thread::spawn(move || {
                             info!("[Offramp::{}] started", offramp_id);
                             for m in rx {
@@ -226,8 +227,8 @@ impl Manager {
                         });
                         r.send(Ok(tx)).await
                     }
-                    None => {
-                        info!("Stopping onramps...");
+                    Err(e) => {
+                        info!("Stopping onramps...: {}", e);
                         break;
                     }
                 };

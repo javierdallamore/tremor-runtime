@@ -11,14 +11,20 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use tremor_pipeline::errors::*;
 use tremor_pipeline::query::Query;
+use tremor_script::errors::CompilerError;
 
-fn to_pipe(query: &str) -> Result<()> {
+fn to_pipe(file_name: String, query: &str) -> std::result::Result<(), CompilerError> {
     let reg = tremor_script::registry();
     let aggr_reg = tremor_script::aggr_registry();
-    let q = Query::parse(query, &reg, &aggr_reg)?;
-    q.to_pipe()?;
+    let module_path = tremor_script::path::load();
+    let cus = vec![];
+    let q = Query::parse(&module_path, query, &file_name, cus, &reg, &aggr_reg)?;
+
+    q.to_pipe().map_err(|error| CompilerError {
+        error: format!("{}", error).into(),
+        cus: vec![],
+    })?;
     Ok(())
 }
 
@@ -27,9 +33,9 @@ macro_rules! test_files {
     ($($file:ident),*) => {
         $(
             #[test]
-            fn $file() -> Result<()> {
+            fn $file() -> std::result::Result<(), CompilerError> {
                 let contents = include_bytes!(concat!("queries/", stringify!($file), ".trickle"));
-                to_pipe(std::str::from_utf8(contents)?)
+                to_pipe("test.trickle".to_string(), std::str::from_utf8(contents).map_err(|e| CompilerError{error: e.into(), cus: vec![]})?)
             }
         )*
     };

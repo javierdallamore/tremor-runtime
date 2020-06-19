@@ -18,11 +18,14 @@ pub mod query;
 pub(crate) mod raw;
 mod support;
 mod upable;
-use crate::errors::*;
+use crate::errors::{error_generic, error_no_consts, error_no_locals, Result};
 use crate::impl_expr2;
-use crate::interpreter::*;
+use crate::interpreter::{AggrType, Cont, Env, ExecOpts, LocalStack};
+pub use crate::lexer::CompilationUnit;
 use crate::pos::{Location, Range};
-use crate::registry::{Aggr as AggrRegistry, Registry, TremorAggrFnWrapper, TremorFnWrapper};
+use crate::registry::{
+    Aggr as AggrRegistry, CustomFn, Registry, TremorAggrFnWrapper, TremorFnWrapper,
+};
 use crate::script::Return;
 use crate::stry;
 use crate::tilde::Extractor;
@@ -34,60 +37,94 @@ use simd_json::{prelude::*, BorrowedValue as Value, KnownKey};
 use std::borrow::{Borrow, Cow};
 use std::mem;
 use upable::Upable;
-
 #[derive(Default, Clone, Serialize, Debug, PartialEq)]
-struct NodeMeta<'script> {
+struct NodeMeta {
     start: Location,
     end: Location,
-    name: Option<Cow<'script, str>>,
+    name: Option<String>,
+    /// Id of current compilation unit part
+    cu: usize,
+    terminal: bool,
 }
 
-impl From<(Location, Location)> for NodeMeta<'static> {
-    fn from((start, end): (Location, Location)) -> Self {
+impl From<(Location, Location, usize)> for NodeMeta {
+    fn from((start, end, cu): (Location, Location, usize)) -> Self {
         Self {
             start,
             end,
             name: None,
+            cu,
+            terminal: false,
         }
     }
 }
 /// Information about node metadata
-#[derive(Default, Clone, Serialize, Debug, PartialEq)]
-pub struct NodeMetas<'script>(Vec<NodeMeta<'script>>);
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct NodeMetas {
+    nodes: Vec<NodeMeta>,
+    #[serde(skip)]
+    pub(crate) cus: Vec<CompilationUnit>,
+}
 
-impl<'script> NodeMetas<'script> {
-    pub(crate) fn add_meta(&mut self, start: Location, end: Location) -> usize {
-        let mid = self.0.len();
-        self.0.push((start, end).into());
+impl<'script> NodeMetas {
+    /// Initializes meta noes with a given set of
+    pub fn new(cus: Vec<CompilationUnit>) -> Self {
+        Self {
+            nodes: Vec::new(),
+            cus,
+        }
+    }
+    pub(crate) fn add_meta(&mut self, mut start: Location, mut end: Location, cu: usize) -> usize {
+        let mid = self.nodes.len();
+        start.set_cu(cu);
+        end.set_cu(cu);
+        self.nodes.push((start, end, cu).into());
         mid
     }
-    pub(crate) fn add_meta_w_name(
+    pub(crate) fn add_meta_w_name<S>(
         &mut self,
-        start: Location,
-        end: Location,
-        name: Cow<'script, str>,
-    ) -> usize {
-        let mid = self.0.len();
-        self.0.push(NodeMeta {
+        mut start: Location,
+        mut end: Location,
+        name: &S,
+        cu: usize,
+    ) -> usize
+    where
+        S: ToString,
+    {
+        start.set_cu(cu);
+        end.set_cu(cu);
+        let mid = self.nodes.len();
+        self.nodes.push(NodeMeta {
             start,
             end,
-            name: Some(name),
+            cu,
+            name: Some(name.to_string()),
+            terminal: false,
         });
         mid
     }
+
     pub(crate) fn start(&self, idx: usize) -> Option<Location> {
-        self.0.get(idx).map(|v| v.start)
+        self.nodes.get(idx).map(|v| v.start)
     }
     pub(crate) fn end(&self, idx: usize) -> Option<Location> {
-        self.0.get(idx).map(|v| v.end)
+        self.nodes.get(idx).map(|v| v.end)
     }
-    pub(crate) fn name(&self, idx: usize) -> Option<&Cow<'script, str>> {
-        self.0.get(idx).map(|v| v.name.as_ref()).and_then(|v| v)
+    pub(crate) fn name(&self, idx: usize) -> Option<&String> {
+        self.nodes.get(idx).map(|v| v.name.as_ref()).and_then(|v| v)
     }
-    pub(crate) fn name_dflt(&self, idx: usize) -> Cow<'script, str> {
+    /// Returns the CU for a meta node
+    pub fn cu(&self, idx: usize) -> Option<&str> {
+        self.nodes
+            .get(idx)
+            .and_then(|e| self.cus.get(e.cu))
+            .and_then(CompilationUnit::to_str)
+    }
+
+    pub(crate) fn name_dflt(&self, idx: usize) -> String {
         self.name(idx)
             .cloned()
-            .unwrap_or_else(|| String::from("<UNKNOWN>").into())
+            .unwrap_or_else(|| String::from("<UNKNOWN>"))
     }
 }
 
@@ -102,6 +139,117 @@ pub struct Warning {
     pub msg: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct Function<'script> {
+    is_const: bool,
+    argc: usize,
+    name: Cow<'script, str>,
+}
+
+/// Documentaiton from constant
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConstDoc<'script> {
+    /// Constant name
+    pub name: Cow<'script, str>,
+    /// Constant documentation
+    pub doc: Option<String>,
+    /// Constant value type
+    pub value_type: ValueType,
+}
+
+impl<'script> ToString for ConstDoc<'script> {
+    fn to_string(&self) -> String {
+        format!(
+            r#"
+### {}
+
+*type*: {:?}
+
+{}
+        "#,
+            self.name,
+            self.value_type,
+            &self.doc.clone().unwrap_or_default()
+        )
+    }
+}
+
+/// Documentaiton from function
+#[derive(Debug, Clone, PartialEq)]
+pub struct FnDoc<'script> {
+    /// Function name
+    pub name: Cow<'script, str>,
+    /// Function arguments
+    pub args: Vec<Cow<'script, str>>,
+    /// Function documentation
+    pub doc: Option<String>,
+    /// Whether the function is open or not
+    // TODO clarify what open exactly is
+    pub open: bool,
+}
+
+/// Documentaiton from a module
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ModDoc<'script> {
+    /// Module name
+    pub name: Cow<'script, str>,
+    /// Module documentation
+    pub doc: Option<String>,
+}
+
+impl<'script> ModDoc<'script> {
+    /// Prints the module documentation
+    pub fn print_with_name(&self, name: &str) -> String {
+        format!(
+            r#"
+# {}
+
+
+{}
+        "#,
+            name,
+            &self.doc.clone().unwrap_or_default()
+        )
+    }
+}
+
+impl<'script> ToString for FnDoc<'script> {
+    fn to_string(&self) -> String {
+        format!(
+            r#"
+### {}({})
+
+{}
+        "#,
+            self.name,
+            self.args.join(", "),
+            self.doc.clone().unwrap_or_default()
+        )
+    }
+}
+
+/// Documentaiton from a module
+#[derive(Debug, Clone, PartialEq)]
+pub struct Docs<'script> {
+    /// Constatns
+    pub consts: Vec<ConstDoc<'script>>,
+    /// Functions
+    pub fns: Vec<FnDoc<'script>>,
+    /// Module level documentation
+    pub module: Option<ModDoc<'script>>,
+}
+
+impl<'script> Default for Docs<'script> {
+    fn default() -> Self {
+        Self {
+            consts: Vec::new(),
+            fns: Vec::new(),
+            module: None,
+        }
+    }
+}
+
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct Helper<'script, 'registry>
 where
     'script: 'registry,
@@ -110,8 +258,9 @@ where
     aggr_reg: &'registry AggrRegistry,
     can_emit: bool,
     is_in_aggr: bool,
-    operators: Vec<OperatorDecl<'script>>,
-    scripts: Vec<ScriptDecl<'script>>,
+    windows: HashMap<String, WindowDecl<'script>>,
+    scripts: HashMap<String, ScriptDecl<'script>>,
+    operators: HashMap<String, OperatorDecl<'script>>,
     aggregates: Vec<InvokeAggrFn<'script>>,
     // TODO: Users of the `warnings` field might be helped if `warnings` were a Set. Right now,
     // some places (twice in query/raw.rs) do `append + sort + dedup`. With, e.g., a `BTreeSet`,
@@ -119,9 +268,20 @@ where
     // anyway.
     warnings: Vec<Warning>,
     shadowed_vars: Vec<String>,
+    func_vec: Vec<CustomFn<'script>>,
     pub locals: HashMap<String, usize>,
-    pub consts: HashMap<String, usize>,
-    pub meta: NodeMetas<'script>,
+    pub functions: HashMap<Vec<String>, usize>,
+    pub consts: HashMap<Vec<String>, usize>,
+    pub streams: HashMap<Vec<String>, usize>,
+    pub meta: NodeMetas,
+    pub const_values: Vec<Value<'script>>,
+    docs: Docs<'script>,
+    module: Vec<String>,
+    possible_leaf: bool,
+    fn_argc: usize,
+    is_open: bool,
+    file_offset: Location,
+    cu: usize,
 }
 
 impl<'script, 'registry> Helper<'script, 'registry>
@@ -129,15 +289,19 @@ where
     'script: 'registry,
 {
     pub fn add_meta(&mut self, start: Location, end: Location) -> usize {
-        self.meta.add_meta(start, end)
+        self.meta
+            .add_meta(start - self.file_offset, end - self.file_offset, self.cu)
     }
-    pub fn add_meta_w_name(
-        &mut self,
-        start: Location,
-        end: Location,
-        name: Cow<'script, str>,
-    ) -> usize {
-        self.meta.add_meta_w_name(start, end, name)
+    pub fn add_meta_w_name<S>(&mut self, start: Location, end: Location, name: &S) -> usize
+    where
+        S: ToString,
+    {
+        self.meta.add_meta_w_name(
+            start - self.file_offset,
+            end - self.file_offset,
+            name,
+            self.cu,
+        )
     }
     pub fn has_locals(&self) -> bool {
         self.locals
@@ -147,7 +311,7 @@ where
     pub fn swap(
         &mut self,
         aggregates: &mut Vec<InvokeAggrFn<'script>>,
-        consts: &mut HashMap<String, usize>,
+        consts: &mut HashMap<Vec<String>, usize>,
         locals: &mut HashMap<String, usize>,
     ) {
         mem::swap(&mut self.aggregates, aggregates);
@@ -155,20 +319,61 @@ where
         mem::swap(&mut self.locals, locals);
     }
 
-    pub fn new(reg: &'registry Registry, aggr_reg: &'registry AggrRegistry) -> Self {
+    pub fn swap2(
+        &mut self,
+        aggregates: &mut Vec<InvokeAggrFn<'script>>,
+        //consts: &mut HashMap<Vec<String>, usize>,
+        locals: &mut HashMap<String, usize>,
+    ) {
+        mem::swap(&mut self.aggregates, aggregates);
+        //mem::swap(&mut self.consts, consts);
+        mem::swap(&mut self.locals, locals);
+    }
+
+    pub fn new(
+        reg: &'registry Registry,
+        aggr_reg: &'registry AggrRegistry,
+        cus: Vec<crate::lexer::CompilationUnit>,
+    ) -> Self {
         Helper {
             reg,
             aggr_reg,
-            is_in_aggr: false,
             can_emit: true,
-            operators: Vec::new(),
-            scripts: Vec::new(),
+            is_in_aggr: false,
+            windows: HashMap::new(),
+            scripts: HashMap::new(),
+            operators: HashMap::new(),
             aggregates: Vec::new(),
             warnings: Vec::new(),
             locals: HashMap::new(),
             consts: HashMap::new(),
+            streams: HashMap::new(),
+            functions: HashMap::new(),
+            func_vec: Vec::new(),
             shadowed_vars: Vec::new(),
-            meta: NodeMetas::default(),
+            meta: NodeMetas::new(cus),
+            docs: Docs::default(),
+            module: Vec::new(),
+            possible_leaf: false,
+            fn_argc: 0,
+            is_open: false,
+            const_values: Vec::new(),
+            file_offset: Location::default(),
+            cu: 0,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn register_fun(&mut self, f: CustomFn<'script>) -> Result<usize> {
+        let i = self.func_vec.len();
+        let mut mf = self.module.clone();
+        mf.push(f.name.clone().to_string());
+
+        if self.functions.insert(mf, i).is_none() {
+            self.func_vec.push(f);
+            Ok(i)
+        } else {
+            Err(format!("function {} already defined.", f.name).into())
         }
     }
 
@@ -218,7 +423,7 @@ where
             self.locals.len() - 1
         }
     }
-    fn is_const(&self, id: &str) -> Option<&usize> {
+    fn is_const(&self, id: &[String]) -> Option<&usize> {
         self.consts.get(id)
     }
 }
@@ -226,17 +431,25 @@ where
 /// A tremor script instance
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Script<'script> {
+    /// Import definitions
+    imports: Imports<'script>,
     /// Expressions of the script
-    exprs: Exprs<'script>,
+    pub(crate) exprs: Exprs<'script>,
     /// Constants defined in this script
     pub consts: Vec<Value<'script>>,
     aggregates: Vec<InvokeAggrFn<'script>>,
+    windows: HashMap<String, WindowDecl<'script>>,
+    functions: Vec<CustomFn<'script>>,
     locals: usize,
-    node_meta: NodeMetas<'script>,
+    pub(crate) node_meta: NodeMetas,
+    #[serde(skip)]
+    /// Documentaiton from the script
+    pub docs: Docs<'script>,
 }
 
-impl<'run, 'script, 'event> Script<'script>
+impl<'input, 'run, 'script, 'event> Script<'script>
 where
+    'input: 'script,
     'script: 'event,
     'event: 'run,
 {
@@ -262,6 +475,7 @@ where
             consts: &self.consts,
             aggrs: &self.aggregates,
             meta: &self.node_meta,
+            recursion_limit: crate::recursion_limit(),
         };
 
         while let Some(expr) = exprs.next() {
@@ -290,6 +504,7 @@ where
                 }
             }
         }
+
         // We know that we never get here, sadly rust doesn't
         #[cfg_attr(tarpaulin, skip)]
         Ok(Return::Emit {
@@ -299,6 +514,18 @@ where
     }
 }
 
+/// A lexical compilation unit
+#[derive(Debug, PartialEq, Serialize, Clone)]
+pub enum LexicalUnit<'script> {
+    /// Import declaration with no alias
+    NakedImportDecl(Vec<raw::IdentRaw<'script>>),
+    /// Import declaration with an alias
+    AliasedImportDecl(Vec<raw::IdentRaw<'script>>, raw::IdentRaw<'script>),
+    /// Line directive with embedded "<string> <num> ;"
+    LineDirective(Cow<'script, str>),
+}
+// impl_expr2!(Ident);
+
 /// An ident
 #[derive(Debug, PartialEq, Serialize, Clone)]
 pub struct Ident<'script> {
@@ -307,6 +534,12 @@ pub struct Ident<'script> {
     pub id: Cow<'script, str>,
 }
 impl_expr2!(Ident);
+
+impl<'script> std::fmt::Display for Ident<'script> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.id)
+    }
+}
 
 impl<'script> From<&'script str> for Ident<'script> {
     fn from(id: &'script str) -> Self {
@@ -356,6 +589,8 @@ pub(crate) struct FnDecl<'script> {
     pub args: Vec<Ident<'script>>,
     pub body: Exprs<'script>,
     pub locals: usize,
+    pub open: bool,
+    pub inline: bool,
 }
 impl_expr2!(FnDecl);
 
@@ -464,6 +699,7 @@ pub(crate) enum ImutExprInt<'script> {
     Invoke3(Invoke<'script>),
     Invoke(Invoke<'script>),
     InvokeAggr(InvokeAggr),
+    Recur(Recur<'script>),
 }
 
 fn is_lit<'script>(e: &ImutExprInt<'script>) -> bool {
@@ -484,13 +720,75 @@ impl_expr2!(EmitExpr);
 #[derive(Clone, Serialize)]
 pub(crate) struct Invoke<'script> {
     pub mid: usize,
-    pub module: String,
+    pub module: Vec<String>,
     pub fun: String,
     #[serde(skip)]
-    pub invocable: TremorFnWrapper,
+    pub invocable: Invocable<'script>,
     pub args: ImutExprs<'script>,
 }
 impl_expr2!(Invoke);
+
+impl<'script> Invoke<'script> {
+    fn inline(self) -> Result<ImutExprInt<'script>> {
+        self.invocable.inline(self.args, self.mid)
+    }
+    fn can_inline(&self) -> bool {
+        self.invocable.can_inline()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum Invocable<'script> {
+    Intrinsic(TremorFnWrapper),
+    Tremor(CustomFn<'script>),
+}
+
+use crate::registry::FResult;
+
+impl<'script> Invocable<'script> {
+    fn inline(self, args: ImutExprs<'script>, mid: usize) -> Result<ImutExprInt<'script>> {
+        match self {
+            Invocable::Intrinsic(_f) => Err("can't inline intrinsic".into()),
+            Invocable::Tremor(f) => f.inline(args, mid),
+        }
+    }
+    fn can_inline(&self) -> bool {
+        match self {
+            Invocable::Intrinsic(_f) => false,
+            Invocable::Tremor(f) => f.can_inline(),
+        }
+    }
+
+    fn is_const(&self) -> bool {
+        match self {
+            Invocable::Intrinsic(f) => f.is_const(),
+            Invocable::Tremor(f) => f.is_const(),
+        }
+    }
+    pub fn invoke<'event, 'run>(
+        &'script self,
+        env: &'run Env<'run, 'event, 'script>,
+        args: &'run [&'run Value<'event>],
+    ) -> FResult<Value<'event>>
+    where
+        'script: 'event,
+        'event: 'run,
+    {
+        match self {
+            Invocable::Intrinsic(f) => f.invoke(env.context, args),
+            Invocable::Tremor(f) => f.invoke(env, args),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct Recur<'script> {
+    pub mid: usize,
+    pub argc: usize,
+    pub open: bool,
+    pub exprs: ImutExprs<'script>,
+}
+impl_expr2!(Recur);
 
 #[derive(Clone, Serialize)]
 pub(crate) struct InvokeAggr {
@@ -646,6 +944,7 @@ pub(crate) struct ImutComprehensionCase<'script> {
 }
 impl_expr2!(ImutComprehensionCase);
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) enum Pattern<'script> {
     //Predicate(PredicatePattern<'script>),
@@ -653,6 +952,8 @@ pub(crate) enum Pattern<'script> {
     Array(ArrayPattern<'script>),
     Expr(ImutExprInt<'script>),
     Assign(AssignPattern<'script>),
+    Tuple(TuplePattern<'script>),
+    DoNotCare,
     Default,
 }
 impl<'script> Pattern<'script> {
@@ -681,12 +982,12 @@ pub(crate) enum PredicatePattern<'script> {
         key: KnownKey<'script>,
         test: Box<TestExpr>,
     },
-    Eq {
+    Bin {
         lhs: Cow<'script, str>,
         #[serde(skip)]
         key: KnownKey<'script>,
         rhs: ImutExprInt<'script>,
-        not: bool,
+        kind: BinOpKind,
     },
     RecordPatternEq {
         lhs: Cow<'script, str>,
@@ -714,10 +1015,12 @@ pub(crate) enum PredicatePattern<'script> {
 
 impl<'script> PredicatePattern<'script> {
     pub fn key(&self) -> &KnownKey<'script> {
-        use PredicatePattern::*;
+        use PredicatePattern::{
+            ArrayPatternEq, Bin, FieldAbsent, FieldPresent, RecordPatternEq, TildeEq,
+        };
         match self {
             TildeEq { key, .. }
-            | Eq { key, .. }
+            | Bin { key, .. }
             | RecordPatternEq { key, .. }
             | ArrayPatternEq { key, .. }
             | FieldPresent { key, .. }
@@ -726,10 +1029,12 @@ impl<'script> PredicatePattern<'script> {
     }
 
     fn lhs(&self) -> &Cow<'script, str> {
-        use PredicatePattern::*;
+        use PredicatePattern::{
+            ArrayPatternEq, Bin, FieldAbsent, FieldPresent, RecordPatternEq, TildeEq,
+        };
         match self {
             TildeEq { lhs, .. }
-            | Eq { lhs, .. }
+            | Bin { lhs, .. }
             | RecordPatternEq { lhs, .. }
             | ArrayPatternEq { lhs, .. }
             | FieldPresent { lhs, .. }
@@ -750,6 +1055,7 @@ pub(crate) enum ArrayPredicatePattern<'script> {
     Expr(ImutExprInt<'script>),
     Tilde(TestExpr),
     Record(RecordPattern<'script>),
+    Ignore,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -757,7 +1063,6 @@ pub(crate) struct ArrayPattern<'script> {
     pub mid: usize,
     pub exprs: ArrayPredicatePatterns<'script>,
 }
-
 impl_expr2!(ArrayPattern);
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -766,6 +1071,14 @@ pub(crate) struct AssignPattern<'script> {
     pub idx: usize,
     pub pattern: Box<Pattern<'script>>,
 }
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct TuplePattern<'script> {
+    pub mid: usize,
+    pub exprs: ArrayPredicatePatterns<'script>,
+    pub open: bool,
+}
+impl_expr2!(TuplePattern);
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) enum Path<'script> {
@@ -923,6 +1236,8 @@ pub(crate) struct UnaryExpr<'script> {
 impl_expr2!(UnaryExpr);
 
 pub(crate) type Exprs<'script> = Vec<Expr<'script>>;
+/// A list of lexical compilation units
+pub type Imports<'script> = Vec<LexicalUnit<'script>>;
 /// A list of immutable expressions
 pub type ImutExprs<'script> = Vec<ImutExpr<'script>>;
 pub(crate) type Fields<'script> = Vec<Field<'script>>;

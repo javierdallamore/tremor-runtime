@@ -13,9 +13,8 @@
 // limitations under the License.
 
 // NOTE: we use a lot of arguments here, we are aware of that but tough luck
-// FIXME: investigate if re-writing would make code better
-#![allow(clippy::too_many_arguments)]
-// FIXME possible optimisations:
+// NOTE: investigate if re-writing would make code better
+// NOTE possible optimisations:
 // * P001 [x] re-write `let x = merge x of ... end` to a mutable merge that does not require cloing `x`
 // * P002 [x] don't construct data for expressions that return value is never used
 // * P003 [x] don't clone as part of a match statement (we should never ever mutate in case or when)
@@ -23,10 +22,11 @@
 // * P005 [x] turn literals into BorrowedValues so we don't need to re-cast them - constants could be pre-laoded
 // * P008 [x] We should not need to clone values in the for comprehension twice.
 
-// FIXME todo
-// * 101 [ ] `%{x > 3}` and other comparisons
+// NOTE todo
+// * 101 [x] `%{x > 3}` and other comparisons
 // * 102 [x] Remove the need for `()` around when clauses that contain binary ops
 
+#![allow(clippy::too_many_arguments)]
 // NOTE: For env / end
 #![allow(clippy::similar_names)]
 
@@ -34,11 +34,20 @@ mod expr;
 mod imut_expr;
 
 pub(crate) use self::expr::Cont;
-use crate::ast::*;
-use crate::errors::*;
+use crate::ast::{
+    ArrayPattern, ArrayPredicatePattern, BaseExpr, BinOpKind, GroupBy, GroupByInt, ImutExprInt,
+    InvokeAggrFn, NodeMetas, Patch, PatchOperation, Path, Pattern, PredicatePattern, RecordPattern,
+    Segment, TuplePattern, UnaryOpKind,
+};
+use crate::errors::{
+    error_array_out_of_bound, error_bad_array_index, error_bad_key, error_decreasing_range,
+    error_guard_not_bool, error_invalid_binary, error_invalid_bitshift, error_need_arr,
+    error_need_int, error_need_obj, error_need_str, error_oops, error_patch_key_exists,
+    error_patch_merge_type_conflict, error_patch_update_key_missing, Result,
+};
 use crate::stry;
 use crate::EventContext;
-use simd_json::borrowed::{Object, Value};
+use simd_json::borrowed::Value;
 use simd_json::prelude::*;
 use simd_json::StaticNode;
 use std::borrow::Borrow;
@@ -74,18 +83,20 @@ where
 {
     /// Context of the event
     pub context: &'run EventContext,
-    /// Constatns
+    /// Constants
     pub consts: &'run [Value<'event>],
     /// Aggregates
     pub aggrs: &'run [InvokeAggrFn<'script>],
     /// Node metadata
-    pub meta: &'run NodeMetas<'script>,
+    pub meta: &'run NodeMetas,
+    /// Maximal recursion depth in custom functions
+    pub recursion_limit: u32,
 }
 
 /// Local variable stack
 #[derive(Default, Debug)]
 pub struct LocalStack<'stack> {
-    values: Vec<Option<Value<'stack>>>,
+    pub(crate) values: Vec<Option<Value<'stack>>>,
 }
 
 impl<'stack> LocalStack<'stack> {
@@ -132,7 +143,7 @@ fn val_eq<'event>(lhs: &Value<'event>, rhs: &Value<'event>) -> bool {
     // FIXME Consider Tony Garnock-Jones perserves w.r.t. forcing a total ordering
     // across builtin types if/when extending for 'lt' and 'gt' variants
     //
-    use Value::*;
+    use Value::{Array, Object, Static, String};
     let error = std::f64::EPSILON;
     match (lhs, rhs) {
         (Object(l), Object(r)) => {
@@ -218,15 +229,15 @@ where
 {
     // Lazy Heinz doesn't want to write that 10000 times
     // - snot badger - Darach
-    use BinOpKind::*;
-    use Value::*;
+    use BinOpKind::{
+        Add, And, BitAnd, BitOr, BitXor, Div, Eq, Gt, Gte, LBitShift, Lt, Lte, Mod, Mul, NotEq, Or,
+        RBitShiftSigned, RBitShiftUnsigned, Sub, Xor,
+    };
+    use Value::{Static, String};
     match (&op, lhs, rhs) {
         (Eq, Static(StaticNode::Null), Static(StaticNode::Null)) => Ok(static_bool!(true)),
         (NotEq, Static(StaticNode::Null), Static(StaticNode::Null)) => Ok(static_bool!(false)),
 
-        // FIXME - do we want this?
-        // This is to make sure that == in a expression
-        // and a record pattern behaves the same.
         (Eq, l, r) => Ok(static_bool!(val_eq(l, r))),
 
         (NotEq, l, r) =>
@@ -360,7 +371,7 @@ pub(crate) fn exec_unary<'run, 'event: 'run>(
 ) -> Option<Cow<'run, Value<'event>>> {
     // Lazy Heinz doesn't want to write that 10000 times
     // - snot badger - Darach
-    use UnaryOpKind::*;
+    use UnaryOpKind::{BitNot, Minus, Not, Plus};
     if let Some(x) = val.as_f64() {
         match &op {
             Minus => Some(Cow::Owned(Value::from(-x))),
@@ -428,17 +439,24 @@ where
                     outer,
                     lpath,
                     &path,
-                    env.meta.name_dflt(lpath.mid).to_string(),
+                    env.meta.name_dflt(lpath.mid),
                     vec![],
                     &env.meta,
                 );
             }
 
-            _ => return error_oops(outer, "Use of unknown local value", &env.meta),
+            _ => return error_oops(outer, 0xdead_0001, "Use of unknown local value", &env.meta),
         },
         Path::Const(lpath) => match env.consts.get(lpath.idx) {
             Some(v) => v,
-            _ => return error_oops(outer, "Use of uninitialized constant", &env.meta),
+            _ => {
+                return error_oops(
+                    outer,
+                    0xdead_0002,
+                    "Use of uninitialized constant",
+                    &env.meta,
+                )
+            }
         },
         Path::Meta(_path) => meta,
         Path::Event(_path) => event,
@@ -461,7 +479,7 @@ where
                         outer,
                         segment, //&Expr::dummy(*start, *end),
                         &path,
-                        env.meta.name_dflt(*mid).to_string(),
+                        env.meta.name_dflt(*mid),
                         o.keys().map(ToString::to_string).collect(),
                         &env.meta,
                     );
@@ -582,14 +600,14 @@ where
                         return error_need_arr(outer, segment, other.value_type(), &env.meta);
                     }
                     // Anything else: err
-                    _ => return error_oops(outer, "Bad path segments", &env.meta),
+                    _ => return error_oops(outer, 0xdead_0003, "Bad path segments", &env.meta),
                 }
             }
         }
     }
 
     if let Some(range_to_consider) = subrange {
-        Ok(Cow::Owned(Value::Array(range_to_consider.to_vec())))
+        Ok(Cow::Owned(Value::from(range_to_consider.to_vec())))
     } else {
         Ok(Cow::Borrowed(current))
     }
@@ -619,7 +637,7 @@ where
             }
         }
     } else {
-        // If one of the two isn't a map we can't merge so we simplhy
+        // If one of the two isn't a map we can't merge so we simply
         // write the replacement into the target.
         // NOTE: We got to clone here since we're duplicating values
         *value = replacement.clone();
@@ -729,7 +747,7 @@ where
                             );
                         }
                         None => {
-                            let mut new_value = Value::from(Object::new());
+                            let mut new_value = Value::object();
                             stry!(merge_values(patch_expr, expr, &mut new_value, &merge_spec));
                             obj.insert(new_key, new_value);
                         }
@@ -798,6 +816,26 @@ where
     'event: 'run,
 {
     match pattern {
+        Pattern::DoNotCare => test_guard(outer, opts, env, event, state, meta, local, guard),
+        Pattern::Tuple(ref tp) => {
+            if stry!(match_tp_expr(
+                outer,
+                opts.without_result(),
+                env,
+                event,
+                state,
+                meta,
+                local,
+                &target,
+                &tp,
+            ))
+            .is_some()
+            {
+                test_guard(outer, opts, env, event, state, meta, local, guard)
+            } else {
+                Ok(false)
+            }
+        }
         Pattern::Record(ref rp) => {
             if stry!(match_rp_expr(
                 outer,
@@ -808,7 +846,7 @@ where
                 meta,
                 local,
                 &target,
-                &rp
+                &rp,
             ))
             .is_some()
             {
@@ -827,7 +865,7 @@ where
                 meta,
                 local,
                 &target,
-                &ap
+                &ap,
             ))
             .is_some()
             {
@@ -847,6 +885,9 @@ where
         }
         Pattern::Assign(ref a) => {
             match *a.pattern {
+                Pattern::DoNotCare => {
+                    test_guard(outer, opts, env, event, state, meta, local, guard)
+                }
                 Pattern::Array(ref ap) => {
                     if let Some(v) = stry!(match_ap_expr(
                         outer,
@@ -903,7 +944,30 @@ where
                         Ok(false)
                     }
                 }
-                _ => error_oops(outer, "Unimplemented pattern", &env.meta),
+                Pattern::Tuple(ref tp) => {
+                    if let Some(v) = stry!(match_tp_expr(
+                        outer,
+                        opts.with_result(),
+                        env,
+                        event,
+                        state,
+                        meta,
+                        local,
+                        &target,
+                        &tp,
+                    )) {
+                        // we need to assign prior to the guard so we can cehck
+                        // against the pattern expressions
+                        stry!(set_local_shadow(outer, local, &env.meta, a.idx, v));
+                        test_guard(outer, opts, env, event, state, meta, local, guard)
+                    } else {
+                        Ok(false)
+                    }
+                }
+                Pattern::Assign(_) => {
+                    error_oops(outer, 0xdead_0004, "nested assign pattern", &env.meta)
+                }
+                Pattern::Default => error_oops(outer, 0xdead_0005, "default in assign", &env.meta),
             }
         }
         Pattern::Default => Ok(true),
@@ -929,11 +993,11 @@ where
     'script: 'event,
     'event: 'run,
 {
-    let mut acc = Value::from(Object::with_capacity(if opts.result_needed {
+    let mut acc = Value::object_with_capacity(if opts.result_needed {
         rp.fields.len()
     } else {
         0
-    }));
+    });
     for pp in &rp.fields {
         let known_key = pp.key();
 
@@ -972,7 +1036,7 @@ where
                     return Ok(None);
                 }
             }
-            PredicatePattern::Eq { rhs, not, .. } => {
+            PredicatePattern::Bin { rhs, kind, .. } => {
                 let testee = if let Some(v) = known_key.lookup(target) {
                     v
                 } else {
@@ -981,10 +1045,9 @@ where
 
                 let rhs = stry!(rhs.run(opts, env, event, state, meta, local));
                 let vb: &Value = rhs.borrow();
-                let r = val_eq(testee, vb);
-                let m = if *not { !r } else { r };
+                let r = exec_binary(outer, outer, &env.meta, *kind, testee, vb)?;
 
-                if m {
+                if r.as_bool().unwrap_or_default() {
                     continue;
                 } else {
                     return Ok(None);
@@ -1065,13 +1128,14 @@ where
         for candidate in a {
             'inner: for expr in &ap.exprs {
                 match expr {
+                    ArrayPredicatePattern::Ignore => continue 'inner,
                     ArrayPredicatePattern::Expr(e) => {
                         let r = stry!(e.run(opts, env, event, state, meta, local));
                         let vb: &Value = r.borrow();
 
                         // NOTE: We are creating a new value here so we have to clone
                         if val_eq(candidate, vb) && opts.result_needed {
-                            acc.push(Value::Array(vec![Value::from(idx), r.into_owned()]));
+                            acc.push(Value::from(vec![Value::from(idx), r.into_owned()]));
                         }
                     }
                     ArrayPredicatePattern::Tilde(test) => {
@@ -1080,7 +1144,7 @@ where
                                 .extract(opts.result_needed, &candidate, &env.context)
                         {
                             if opts.result_needed {
-                                acc.push(Value::Array(vec![Value::from(idx), r]));
+                                acc.push(Value::from(vec![Value::from(idx), r]));
                             }
                         } else {
                             continue 'inner;
@@ -1091,7 +1155,7 @@ where
                             outer, opts, env, event, state, meta, local, candidate, rp,
                         )) {
                             if opts.result_needed {
-                                acc.push(Value::Array(vec![Value::from(idx), r]))
+                                acc.push(Value::from(vec![Value::from(idx), r]))
                             };
                         } else {
                             continue 'inner;
@@ -1101,7 +1165,82 @@ where
             }
             idx += 1;
         }
-        Ok(Some(Value::Array(acc)))
+        Ok(Some(Value::from(acc)))
+    } else {
+        Ok(None)
+    }
+}
+
+#[inline]
+fn match_tp_expr<'run, 'event, 'script, Expr>(
+    outer: &'script Expr,
+    opts: ExecOpts,
+    env: &'run Env<'run, 'event, 'script>,
+    event: &'run Value<'event>,
+    state: &'run Value<'static>,
+    meta: &'run Value<'event>,
+    local: &'run LocalStack<'event>,
+    target: &'run Value<'event>,
+    tp: &'script TuplePattern,
+) -> Result<Option<Value<'event>>>
+where
+    Expr: BaseExpr,
+
+    'script: 'event,
+    'event: 'run,
+{
+    if let Some(a) = target.as_array() {
+        if (tp.open && a.len() < tp.exprs.len()) || (!tp.open && a.len() != tp.exprs.len()) {
+            return Ok(None);
+        }
+        let mut acc = Vec::with_capacity(if opts.result_needed { a.len() } else { 0 });
+        let cases = tp.exprs.iter().zip(a.iter());
+        for (case, candidate) in cases {
+            match case {
+                ArrayPredicatePattern::Ignore => {
+                    if opts.result_needed {
+                        acc.push(candidate.clone());
+                    }
+                }
+                ArrayPredicatePattern::Expr(e) => {
+                    let r = stry!(e.run(opts, env, event, state, meta, local));
+                    let vb: &Value = r.borrow();
+
+                    // NOTE: We are creating a new value here so we have to clone
+                    if val_eq(candidate, vb) {
+                        if opts.result_needed {
+                            acc.push(r.into_owned());
+                        }
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                ArrayPredicatePattern::Tilde(test) => {
+                    if let Ok(r) =
+                        test.extractor
+                            .extract(opts.result_needed, &candidate, &env.context)
+                    {
+                        if opts.result_needed {
+                            acc.push(r);
+                        }
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                ArrayPredicatePattern::Record(rp) => {
+                    if let Some(r) = stry!(match_rp_expr(
+                        outer, opts, env, event, state, meta, local, candidate, rp,
+                    )) {
+                        if opts.result_needed {
+                            acc.push(r)
+                        };
+                    } else {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        Ok(Some(Value::from(acc)))
     } else {
         Ok(None)
     }
@@ -1124,16 +1263,20 @@ where
     use std::mem;
     // This is icky do we want it?
     // it is only used
-    let local: &mut LocalStack = unsafe { mem::transmute(local) };
+    let local: &'run mut LocalStack<'event> = unsafe { mem::transmute(local) };
     if let Some(d) = local.values.get_mut(idx) {
         *d = Some(v);
         Ok(())
     } else {
-        error_oops(outer, "Unknown local variable", &node_meta)
+        error_oops(
+            outer,
+            0xdead_0006,
+            "Unknown local variable in set_local_shadow",
+            &node_meta,
+        )
     }
 }
 
-//FIXME Do we really want this here?
 impl<'script> GroupBy<'script> {
     /// Creates groups based on an event.
     pub fn generate_groups<'run, 'event>(
@@ -1141,7 +1284,7 @@ impl<'script> GroupBy<'script> {
         ctx: &'run EventContext,
         event: &'run Value<'event>,
         state: &'run Value<'static>,
-        node_meta: &'run NodeMetas<'script>,
+        node_meta: &'run NodeMetas,
         meta: &'run Value<'event>,
     ) -> Result<Vec<Vec<Value<'event>>>>
     where
@@ -1155,14 +1298,13 @@ impl<'script> GroupBy<'script> {
     }
 }
 
-//FIXME Do we really want this here?
 impl<'script> GroupByInt<'script> {
     pub(crate) fn generate_groups<'run, 'event>(
         &'script self,
         ctx: &'run EventContext,
         event: &'run Value<'event>,
         state: &'run Value<'static>,
-        node_meta: &'run NodeMetas<'script>,
+        node_meta: &'run NodeMetas,
         meta: &'run Value<'event>,
         groups: &'run mut Vec<Vec<Value<'event>>>,
     ) -> Result<()>
@@ -1183,6 +1325,7 @@ impl<'script> GroupByInt<'script> {
             context: ctx,
             aggrs: &NO_AGGRS,
             meta: node_meta,
+            recursion_limit: crate::recursion_limit(),
         };
         match self {
             GroupByInt::Expr { expr, .. } => {

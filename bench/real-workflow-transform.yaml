@@ -38,8 +38,13 @@ pipeline:
       - id: runtime
         op: runtime::tremor
         config:
-          script: |
-
+          script: |          
+            use std::string;
+            use std::json;
+            use std::type;
+            use std::array;
+            use std::record;
+            use tremor::system;
             let event = patch event of
               upsert "message" => event.full_message,
               upsert "tremor" => system::hostname()
@@ -999,10 +1004,9 @@ pipeline:
 
             # We dont' have the time function yet as we need to collect examples and see what functions are needed
 
-            let event.start_timestamp = datetime::parse(event["@timestamp"], "%Y-%m-%dT%H:%M:%S%.3fZ") / 100;
+            let event.start_timestamp = core::datetime::parse(event["@timestamp"], "%Y-%m-%dT%H:%M:%S%.3fZ") / 100;
              
             event
-
     links:
       in: [runtime]
       runtime: [out]

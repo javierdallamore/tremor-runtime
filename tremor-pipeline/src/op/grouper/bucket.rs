@@ -61,7 +61,7 @@
 //! }
 //! ```
 
-use crate::errors::*;
+use crate::errors::{ErrorKind, Result};
 use crate::{Event, Operator};
 use halfbrown::HashMap;
 use lru::LruCache;
@@ -142,7 +142,7 @@ impl Operator for Grouper {
         _state: &mut Value<'static>,
         event: Event,
     ) -> Result<Vec<(Cow<'static, str>, Event)>> {
-        let meta = &event.data.suffix().meta;
+        let meta = event.data.suffix().meta();
         if let Some(class) = meta.get("class").and_then(Value::as_str) {
             let (_, groups) = self
                 .buckets

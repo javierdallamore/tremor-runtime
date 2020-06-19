@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::errors::*;
+use crate::errors::{Error, Result};
 use std::default;
 use std::fmt;
 use url::Url;
@@ -114,6 +114,8 @@ pub struct EventContext {
     at: u64,
     /// URI of the origin
     pub origin_uri: Option<EventOriginUri>,
+    /// Allow panicing on asserts
+    pub panic_on_assert: bool,
 }
 
 impl EventContext {
@@ -122,6 +124,7 @@ impl EventContext {
         Self {
             at: ingest_ns,
             origin_uri,
+            panic_on_assert: false,
         }
     }
 

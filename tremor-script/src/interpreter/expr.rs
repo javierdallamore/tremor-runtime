@@ -16,11 +16,18 @@ use super::{
     merge_values, patch_value, resolve, set_local_shadow, test_guard, test_predicate_expr, Env,
     ExecOpts, LocalStack, NULL,
 };
-use crate::ast::*;
-use crate::errors::*;
+use crate::ast::{
+    BaseExpr, Comprehension, EmitExpr, EventPath, Expr, ImutExprInt, Match, Merge, Patch, Path,
+    Segment,
+};
+use crate::errors::{
+    error_assign_array, error_assign_to_const, error_bad_key, error_invalid_assign_target,
+    error_missing_effector, error_need_obj, error_no_clause_hit, error_oops, Result,
+};
+use crate::registry::RECUR_PTR;
 use crate::stry;
 use simd_json::prelude::*;
-use simd_json::value::borrowed::{Object, Value};
+use simd_json::value::borrowed::Value;
 
 use std::borrow::{Borrow, Cow};
 
@@ -128,14 +135,53 @@ where
         expr: &'script Patch,
     ) -> Result<Cow<'run, Value<'event>>> {
         use std::mem;
-        // NOTE: Is this good? I don't like it.
-        let value = stry!(expr.target.run(opts, env, event, state, meta, local));
-        let v: &Value = value.borrow();
-        let v: &mut Value = unsafe { mem::transmute(v) };
+        // This function is called when we encounter code that consumes a value
+        // to patch it. So the following code:
+        // ```tremor
+        // let event = patch event of insert "key" => "value" end
+        // ```
+        // When executed on it's own would clone the event, add a key and
+        // overwrite original event.
+        //
+        // We optimise this as:
+        // ```
+        // patch_in_place event of insert "key" => "value" end
+        // ```
+        //
+        // This code is generated in impl Upable for ExprRaw where the following
+        // checks are performed:
+        //
+        // 1) the patch is on the RHS of an assignment
+        // 2) the path of the assigned value and the path of the patched
+        //    expression are identical.
+        //
+        // In turn this guarantees (at compile time):
+        //
+        // 1) The target (`expr`) is a path lookup
+        // 2) The target is not a known constant as otherwise the assignment
+        //    will complan
+        // 3) this leave the `expr` to be either a local, the event, the state,
+        //    metadata or a subkey thereof.
+        //
+        // And the following guarantees at run time:
+        //
+        // 1) the `expr` is an existing key of the mentioned categories,
+        //    otherwise `expr.target.run` will error.
+        // 2) `value` will never be owned (however the resolve function is
+        //    generic so it needs to return a Cow)
+
+        let value: Cow<'run, Value<'event>> =
+            stry!(expr.target.run(opts, env, event, state, meta, local));
+        debug_assert!(
+            !matches!(value, Cow::Owned(_)),
+            "We should never see a owned value here as patch_in_place is only ever called on existing data in event, state, meta or local"
+        );
+        let v: &Value<'event> = value.borrow();
+        let v: &mut Value<'event> = unsafe { mem::transmute(v) };
         stry!(patch_value(
             self, opts, env, event, state, meta, local, v, expr
         ));
-        Ok(Cow::Borrowed(v))
+        Ok(value)
     }
 
     #[allow(mutable_transmutes, clippy::transmute_ptr_to_ptr)]
@@ -150,22 +196,29 @@ where
         expr: &'script Merge,
     ) -> Result<Cow<'run, Value<'event>>> {
         use std::mem;
-        // NOTE: Is this good? I don't like it.
-        let value_cow = stry!(expr.target.run(opts, env, event, state, meta, local));
-        let value: &Value = value_cow.borrow();
-        let value: &mut Value = unsafe { mem::transmute(value) };
+        // Please see the soundness reasoning in `patch_in_place` for details
+        // those functions perform the same function just with slighty different
+        // operations.
+        let value_cow: Cow<'run, Value<'event>> =
+            stry!(expr.target.run(opts, env, event, state, meta, local));
+        debug_assert!(
+            !matches!(value_cow, Cow::Owned(_)),
+            "We should never see a owned value here as merge_in_place is only ever called on existing data in event, state, meta or local"
+        );
 
-        if value.is_object() {
+        if value_cow.is_object() {
+            let value: &Value<'event> = value_cow.borrow();
+            let value: &mut Value<'event> = unsafe { mem::transmute(value) };
             let replacement = stry!(expr.expr.run(opts, env, event, state, meta, local,));
 
             if replacement.is_object() {
                 stry!(merge_values(self, &expr.expr, value, &replacement));
-                Ok(Cow::Borrowed(value))
+                Ok(value_cow)
             } else {
                 error_need_obj(self, &expr.expr, replacement.value_type(), &env.meta)
             }
         } else {
-            error_need_obj(self, &expr.target, value.value_type(), &env.meta)
+            error_need_obj(self, &expr.target, value_cow.value_type(), &env.meta)
         }
     }
 
@@ -254,7 +307,7 @@ where
                 count += 1;
             }
         }
-        Ok(Cont::Cont(Cow::Owned(Value::Array(value_vec))))
+        Ok(Cont::Cont(Cow::Owned(Value::from(value_vec))))
     }
 
     #[allow(
@@ -280,7 +333,7 @@ where
          * as immutable and mem::transmute it to mutable where needed.
          *
          * We do this since there is no way to tell rust that it's safe
-         * to borrow immuatble out of something that's mutable even if
+         * to borrow immutable out of something that's mutable even if
          * we clone data out.
          *
          * This is safe because:
@@ -305,15 +358,11 @@ where
         let mut current: &Value = unsafe {
             match path {
                 Path::Const(p) => {
-                    return error_assign_to_const(
-                        self,
-                        env.meta.name_dflt(p.mid).to_string(),
-                        &env.meta,
-                    )
+                    return error_assign_to_const(self, env.meta.name_dflt(p.mid), &env.meta)
                 }
                 Path::Local(lpath) => match local.values.get(lpath.idx) {
                     Some(Some(l)) => {
-                        let l: &mut Value = mem::transmute(l);
+                        let l: &mut Value<'event> = mem::transmute(l);
                         if segments.is_empty() {
                             *l = value;
                             return Ok(Cow::Borrowed(l));
@@ -321,26 +370,26 @@ where
                         l
                     }
                     Some(d) => {
-                        let d: &mut Option<Value> = mem::transmute(d);
+                        let d: &mut Option<Value<'event>> = mem::transmute(d);
                         if segments.is_empty() {
                             *d = Some(value);
                             if let Some(l) = d {
                                 return Ok(Cow::Borrowed(l));
                             } else {
-                                return error_oops(self, "Unreacable code", &env.meta);
+                                return error_oops(self, 0xdead_0009, "Unreacable code", &env.meta);
                             }
                         }
                         return error_bad_key(
                             self,
                             lpath,
                             &path,
-                            env.meta.name_dflt(lpath.mid).to_string(),
+                            env.meta.name_dflt(lpath.mid),
                             vec![],
                             &env.meta,
                         );
                     }
 
-                    _ => return error_oops(self, "Unknown local varialbe", &env.meta),
+                    _ => return error_oops(self, 0xdead_000a, "Unknown local varialbe", &env.meta),
                 },
                 Path::Meta(_path) => {
                     if segments.is_empty() {
@@ -378,7 +427,7 @@ where
                     Segment::Id { key, .. } => {
                         current = if let Ok(next) = key.lookup_or_insert_mut(
                             mem::transmute::<&Value, &mut Value>(current),
-                            || Value::from(Object::with_capacity(halfbrown::VEC_LIMIT_UPPER)),
+                            || Value::object_with_capacity(halfbrown::VEC_LIMIT_UPPER),
                         ) {
                             next
                         } else {
@@ -387,13 +436,13 @@ where
                     }
                     Segment::Element { expr, .. } => {
                         let id = stry!(expr.eval_to_string(opts, env, event, state, meta, local));
-                        let v: &mut Value = mem::transmute(current);
+                        let v: &mut Value<'event> = mem::transmute(current);
                         if let Some(map) = v.as_object_mut() {
                             current = if let Some(v) = map.get_mut(&id) {
                                 v
                             } else {
                                 map.entry(id)
-                                    .or_insert_with(|| Value::from(Object::with_capacity(32)))
+                                    .or_insert_with(|| Value::object_with_capacity(32))
                             }
                         } else {
                             return error_need_obj(self, segment, current.value_type(), &env.meta);
@@ -406,7 +455,7 @@ where
             }
         }
         unsafe {
-            *mem::transmute::<&Value, &mut Value>(current) = value;
+            *mem::transmute::<&Value<'event>, &mut Value<'event>>(current) = value;
         }
         if opts.result_needed {
             //Ok(Cow::Borrowed(current))
@@ -470,10 +519,20 @@ where
                     if let Some(v) = opt {
                         v
                     } else {
-                        return error_oops(self, "Unknown local variable", &env.meta);
+                        return error_oops(
+                            self,
+                            0xdead_000c,
+                            "Unknown local variable in Expr::AssignMoveLocal",
+                            &env.meta,
+                        );
                     }
                 } else {
-                    return error_oops(self, "Unknown local variable", &env.meta);
+                    return error_oops(
+                        self,
+                        0xdead_000b,
+                        "Unknown local variable in Expr::AssignMoveLocal",
+                        &env.meta,
+                    );
                 };
                 self.assign(opts, env, event, state, meta, local, &path, value)
                     .map(Cont::Cont)
@@ -499,12 +558,20 @@ where
             Expr::Imut(expr) => {
                 // If we don't need the result of a immutable value then we
                 // don't need to evaluate it.
-                if opts.result_needed {
-                    expr.run(opts, env, event, state, meta, local)
-                        .map(Cont::Cont)
+                let r = if opts.result_needed {
+                    expr.run(opts, env, event, state, meta, local)?
                 } else {
-                    Ok(Cont::Cont(Cow::Borrowed(&NULL)))
-                }
+                    Cow::Borrowed(&NULL)
+                };
+                if let Cow::Borrowed(v) = r {
+                    let this_ptr = v.as_str().map(str::as_ptr);
+                    if this_ptr == RECUR_PTR {
+                        // NOTE: we abuse drop here to imply recursion - yes it
+                        // makes no sense!
+                        return Ok(Cont::Drop);
+                    }
+                };
+                Ok(Cont::Cont(r))
             }
         }
     }

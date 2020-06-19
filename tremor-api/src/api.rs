@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use http_types::headers;
-pub(crate) use http_types::StatusCode;
+pub use http_types::headers;
+pub use http_types::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::convert::TryInto;
-pub(crate) use tide::Response;
+pub use tide::Response;
 use tremor_runtime::errors::{Error as TremorError, ErrorKind};
 use tremor_runtime::system::World;
 use tremor_runtime::url::TremorURL;
@@ -25,6 +24,7 @@ pub mod binding;
 pub mod offramp;
 pub mod onramp;
 pub mod pipeline;
+pub mod prelude;
 pub mod version;
 
 pub type Request = tide::Request<State>;
@@ -70,10 +70,17 @@ impl Error {
 impl Into<Response> for Error {
     fn into(self) -> Response {
         match self {
-            Error::Generic(c, d) => Response::new(c).body_string(d),
-            Error::JSON(c, d) => Response::new(c)
-                .body_string(d)
-                .set_header(headers::CONTENT_TYPE, ResourceType::Json.to_string()),
+            Error::Generic(c, d) => {
+                let mut r = Response::new(c);
+                r.set_body(d);
+                r
+            }
+            Error::JSON(c, d) => {
+                let mut r = Response::new(c);
+                r.insert_header(headers::CONTENT_TYPE, ResourceType::Json.to_string());
+                r.set_body(d);
+                r
+            }
         }
     }
 }
@@ -84,8 +91,8 @@ impl From<std::io::Error> for Error {
     }
 }
 
-impl From<serde_json::Error> for Error {
-    fn from(e: serde_json::Error) -> Self {
+impl From<simd_json::Error> for Error {
+    fn from(e: simd_json::Error) -> Self {
         Self::generic(
             StatusCode::BadRequest,
             &format!("json encoder failed: {}", e),
@@ -134,7 +141,7 @@ impl ToString for ResourceType {
 pub fn content_type(req: &Request) -> Option<ResourceType> {
     match req
         .header(&headers::CONTENT_TYPE)
-        .and_then(|v| v.first())
+        .map(headers::HeaderValues::last)
         .map(headers::HeaderValue::as_str)
     {
         Some("application/yaml") => Some(ResourceType::Yaml),
@@ -145,11 +152,9 @@ pub fn content_type(req: &Request) -> Option<ResourceType> {
 
 pub fn accept(req: &Request) -> ResourceType {
     // TODO implement correctly / RFC compliance
-    match "Accept"
-        .try_into()
-        .ok()
-        .and_then(|h| req.header(&h))
-        .and_then(|v| v.first())
+    match req
+        .header(headers::ACCEPT)
+        .map(headers::HeaderValues::last)
         .map(headers::HeaderValue::as_str)
     {
         Some("application/yaml") => ResourceType::Yaml,
@@ -190,13 +195,19 @@ pub fn serialize<T: Serialize>(
     ok_code: StatusCode,
 ) -> std::result::Result<Response, crate::Error> {
     match t {
-        ResourceType::Yaml => Ok(Response::new(ok_code)
-            .body_string(serde_yaml::to_string(d)?)
-            .set_header(headers::CONTENT_TYPE, t.to_string())),
+        ResourceType::Yaml => {
+            let mut r = Response::new(ok_code);
+            r.insert_header(headers::CONTENT_TYPE, t.to_string());
+            r.set_body(serde_yaml::to_string(d)?);
+            Ok(r)
+        }
 
-        ResourceType::Json => Ok(Response::new(ok_code)
-            .body_string(serde_json::to_string(d)?)
-            .set_header(headers::CONTENT_TYPE, t.to_string())),
+        ResourceType::Json => {
+            let mut r = Response::new(ok_code);
+            r.insert_header(headers::CONTENT_TYPE, t.to_string());
+            r.set_body(simd_json::to_string(d)?);
+            Ok(r)
+        }
     }
 }
 
@@ -217,7 +228,7 @@ async fn decode<T>(mut req: Request) -> Result<(Request, T)>
 where
     for<'de> T: Deserialize<'de>,
 {
-    let body = req.body_bytes().await?;
+    let mut body = req.body_bytes().await?;
     match content_type(&req) {
         Some(ResourceType::Yaml) => serde_yaml::from_slice(body.as_slice())
             .map_err(|e| {
@@ -227,7 +238,7 @@ where
                 )
             })
             .map(|data| (req, data)),
-        Some(ResourceType::Json) => serde_json::from_slice(body.as_slice())
+        Some(ResourceType::Json) => simd_json::from_slice(body.as_mut_slice())
             .map_err(|e| {
                 Error::Generic(
                     StatusCode::BadRequest,

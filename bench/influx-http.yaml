@@ -6,8 +6,8 @@ onramp:
     type: blaster
     codec: influx
     config:
-      #source: ./demo/data/data.influx.xz
-      source: ../pocs/data.influx
+      source: ./demo/data/data.influx.xz
+      #source: ../pocs/data.influx
       #interval: 500 # 1_000_000 / s
 
 offramp:
@@ -40,6 +40,7 @@ pipeline:
         op: runtime::tremor
         config:
           script: |
+            use tremor::system;
             let event.timestamp = system::ingest_ns();
             event
       - id: batch

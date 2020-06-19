@@ -35,7 +35,7 @@ mod datetime;
 pub mod docs;
 /// Errors
 pub mod errors;
-/// GROK implementaiton
+/// Grok implementation
 pub mod grok;
 /// Tremor Script highlighter
 pub mod highlighter;
@@ -46,6 +46,8 @@ pub mod lexer;
 // We need this because of lalrpop
 #[allow(unused)]
 pub(crate) mod parser;
+/// Support for module paths
+pub mod path;
 /// Tremor Script Position
 pub mod pos;
 /// Prelude module with important exports
@@ -54,7 +56,8 @@ pub mod prelude;
 pub mod query;
 /// Function registry
 pub mod registry;
-pub(crate) mod script;
+/// Tremor Script
+pub mod script;
 mod std_lib;
 mod tilde;
 /// Utility functions
@@ -78,24 +81,61 @@ pub use crate::registry::{
     TremorAggrFnWrapper, TremorFn, TremorFnWrapper,
 };
 pub use crate::script::{Return, Script};
+
 pub use interpreter::{AggrType, FALSE, NULL, TRUE};
 pub use simd_json::value::borrowed::Object;
 pub use simd_json::value::borrowed::Value;
 
+/// Default recursion limit
+pub static mut RECURSION_LIMIT: u32 = 1024;
+
+/// recursion limit
+#[inline]
+pub fn recursion_limit() -> u32 {
+    unsafe { RECURSION_LIMIT }
+}
+
 /// Combined struct for an event value and metadata
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ValueAndMeta<'event> {
+    data: (Value<'event>, Value<'event>),
+}
+
+impl<'event> ValueAndMeta<'event> {
+    /// A value from it's parts
+    pub fn from_parts(v: Value<'event>, m: Value<'event>) -> Self {
+        Self { data: (v, m) }
+    }
     /// Event value
-    pub value: Value<'event>,
+    pub fn value(&self) -> &Value<'event> {
+        &self.data.0
+    }
+    /// Event value forced to borrowd mutable (uses `mem::transmute`)
+    ///
+    /// # Safety
+    /// This isn't save, use with care and reason about mutability!
+    #[allow(mutable_transmutes, clippy::transmute_ptr_to_ptr, clippy::mut_from_ref)]
+    pub unsafe fn force_value_mut(&self) -> &mut Value<'event> {
+        std::mem::transmute(&self.data.0)
+    }
+    /// Event value
+    pub fn value_mut(&mut self) -> &mut Value<'event> {
+        &mut self.data.0
+    }
     /// Event metadata
-    pub meta: Value<'event>,
+    pub fn meta(&self) -> &Value<'event> {
+        &self.data.1
+    }
+    /// Deconstruicts the value into it's parts
+    pub fn into_parts(self) -> (Value<'event>, Value<'event>) {
+        self.data
+    }
 }
 
 impl<'event> Default for ValueAndMeta<'event> {
     fn default() -> Self {
         ValueAndMeta {
-            value: Value::from(Object::default()),
-            meta: Value::from(Object::default()),
+            data: (Value::object(), Value::object()),
         }
     }
 }
@@ -103,8 +143,7 @@ impl<'event> Default for ValueAndMeta<'event> {
 impl<'v> From<Value<'v>> for ValueAndMeta<'v> {
     fn from(value: Value<'v>) -> ValueAndMeta<'v> {
         ValueAndMeta {
-            value,
-            meta: Value::from(Object::default()),
+            data: (value, Value::object()),
         }
     }
 }
@@ -119,7 +158,7 @@ rental! {
 
         /// Rental wrapped value with the data it was parsed
         /// from from
-        #[rental_mut(covariant,debug)]
+        #[rental_mut(covariant, debug)]
         pub struct Value {
             raw: Vec<Vec<u8>>,
             parsed: ValueAndMeta<'raw>
@@ -133,11 +172,16 @@ impl rentals::Value {
     /// This borrows the data as immutable and then transmutes it
     /// to be mutable.
     #[allow(mutable_transmutes, clippy::transmute_ptr_to_ptr)]
-    pub fn parts(&self) -> (&mut Value, &mut Value) {
+    pub fn parts<'value, 'borrow>(
+        &'borrow self,
+    ) -> (&'borrow mut Value<'value>, &'borrow mut Value<'value>)
+    where
+        'borrow: 'value,
+    {
         unsafe {
             let data = self.suffix();
-            let unwind_event: &mut Value<'_> = std::mem::transmute(&data.value);
-            let event_meta: &mut Value<'_> = std::mem::transmute(&data.meta);
+            let unwind_event: &'borrow mut Value<'value> = std::mem::transmute(data.value());
+            let event_meta: &'borrow mut Value<'value> = std::mem::transmute(data.meta());
             (unwind_event, event_meta)
         }
     }
@@ -162,19 +206,19 @@ impl rentals::Value {
     /// to modify its content by adding the owned parts of
     /// `other` into the owned part `self` and the running
     /// a merge function on the borrowed parts
-    pub fn consume<E, F>(&mut self, other: Self, join_f: F) -> Result<(), E>
+    pub fn consume<'run, E, F>(&'run mut self, other: Self, join_f: F) -> Result<(), E>
     where
         E: std::error::Error,
         F: Fn(&mut ValueAndMeta<'static>, ValueAndMeta<'static>) -> Result<(), E>,
     {
-        pub struct ScrewRental {
+        struct ScrewRental {
             pub parsed: ValueAndMeta<'static>,
             pub raw: Vec<Vec<u8>>,
         }
         #[allow(clippy::transmute_ptr_to_ptr)]
         unsafe {
             use std::mem::transmute;
-            let self_unrent: &mut ScrewRental = transmute(self);
+            let self_unrent: &'run mut ScrewRental = transmute(self);
             let mut other_unrent: ScrewRental = transmute(other);
             self_unrent.raw.append(&mut other_unrent.raw);
             join_f(&mut self_unrent.parsed, other_unrent.parsed)?;
@@ -185,10 +229,7 @@ impl rentals::Value {
 
 impl From<simd_json::BorrowedValue<'static>> for rentals::Value {
     fn from(v: simd_json::BorrowedValue<'static>) -> Self {
-        Self::new(vec![], |_| ValueAndMeta {
-            value: v,
-            meta: Value::from(Object::new()),
-        })
+        Self::new(vec![], |_| ValueAndMeta::from(v))
     }
 }
 
@@ -204,10 +245,7 @@ impl
             simd_json::BorrowedValue<'static>,
         ),
     ) -> Self {
-        Self::new(vec![], |_| ValueAndMeta {
-            value: v.0,
-            meta: v.1,
-        })
+        Self::new(vec![], |_| ValueAndMeta { data: v })
     }
 }
 
@@ -224,8 +262,7 @@ impl
         ),
     ) -> Self {
         Self::new(vec![], |_| ValueAndMeta {
-            value: v.0,
-            meta: Value::from(v.1),
+            data: (v.0, Value::from(v.1)),
         })
     }
 }
@@ -241,10 +278,7 @@ impl Clone for LineValue {
         // instead of a Box.
         Self::new(vec![], |_| {
             let v = self.suffix();
-            ValueAndMeta {
-                value: v.value.clone_static(),
-                meta: v.meta.clone_static(),
-            }
+            ValueAndMeta::from_parts(v.value().clone_static(), v.meta().clone_static())
         })
     }
 }
@@ -258,7 +292,7 @@ impl Serialize for LineValue {
     }
 }
 
-/// An error ocured while deserializing
+/// An error occurred while deserializing
 /// a value into an Event.
 pub enum LineValueDeserError {
     /// The value was missing the `value` key
@@ -290,9 +324,8 @@ impl<'de> Deserialize<'de> for LineValue {
         } else {
             return Err(D::Error::custom("meta field missing"));
         };
-        Ok(Self::new(vec![], |_| ValueAndMeta {
-            value: value.clone().into(),
-            meta: meta.clone().into(),
+        Ok(Self::new(vec![], |_| {
+            ValueAndMeta::from_parts(value.clone().into(), meta.clone().into())
         }))
     }
 }
@@ -311,14 +344,15 @@ mod tests {
     use crate::errors::*;
     use crate::interpreter::AggrType;
     use crate::lexer::TokenSpan;
+    use crate::path::ModulePath;
     use halfbrown::hashmap;
-    use simd_json::borrowed::{Object, Value};
+    use simd_json::borrowed::Value;
 
     macro_rules! eval {
         ($src:expr, $expected:expr) => {{
             let _r: Registry = registry();
-            let src = format!("{} ", $src);
-            let lexed_tokens: Result<Vec<TokenSpan>> = lexer::Tokenizer::new(&src).collect();
+            let mut src: String = format!("{} ", $src.to_string());
+            let lexed_tokens: Result<Vec<TokenSpan>> = lexer::Tokenizer::new(&mut src).collect();
             let lexed_tokens = lexed_tokens.expect("");
             let mut filtered_tokens: Vec<Result<TokenSpan>> = Vec::new();
 
@@ -329,10 +363,12 @@ mod tests {
                 }
             }
             let reg: Registry = registry::registry();
-            let runnable: Script = Script::parse($src, &reg).expect("parse failed");
-            let mut event = Value::from(Object::new());
+            let runnable: Script =
+                Script::parse(&ModulePath { mounts: vec![] }, "<test>", src, &reg)
+                    .expect("parse failed");
+            let mut event = Value::object();
             let mut state = Value::null();
-            let mut global_map = Value::from(Object::new());
+            let mut global_map = Value::object();
             let value = runnable.run(
                 &EventContext::new(0, None),
                 AggrType::Emit,
@@ -353,8 +389,8 @@ mod tests {
     macro_rules! eval_global {
         ($src:expr, $expected:expr) => {{
             let _r: Registry = registry();
-            //let src = format!("{}", $src);
-            let lexed_tokens: Result<Vec<TokenSpan>> = lexer::Tokenizer::new($src).collect();
+            let mut src = format!("{} ", $src).to_string();
+            let lexed_tokens: Result<Vec<TokenSpan>> = lexer::Tokenizer::new(&mut src).collect();
             let lexed_tokens = lexed_tokens.expect("");
             let mut filtered_tokens: Vec<Result<TokenSpan>> = Vec::new();
 
@@ -365,7 +401,9 @@ mod tests {
                 }
             }
             let reg: Registry = registry::registry();
-            let runnable: Script = Script::parse($src, &reg).expect("parse failed");
+            let runnable: Script =
+                Script::parse(&ModulePath { mounts: vec![] }, "<test>", src, &reg)
+                    .expect("parse failed");
             let mut event = Value::object();
             let mut state = Value::null();
             let mut global_map = Value::from(hashmap! {});
@@ -383,8 +421,8 @@ mod tests {
     macro_rules! eval_event {
         ($src:expr, $expected:expr) => {{
             let _r: Registry = registry();
-            //let src = format!("{}", $src);
-            let lexed_tokens: Result<Vec<TokenSpan>> = lexer::Tokenizer::new($src).collect();
+            let mut src = format!("{} ", $src).to_string();
+            let lexed_tokens: Result<Vec<TokenSpan>> = lexer::Tokenizer::new(&mut src).collect();
             let lexed_tokens = lexed_tokens.expect("");
             let mut filtered_tokens: Vec<Result<TokenSpan>> = Vec::new();
 
@@ -395,7 +433,9 @@ mod tests {
                 }
             }
             let reg: Registry = registry::registry();
-            let runnable: Script = Script::parse($src, &reg).expect("parse failed");
+            let runnable: Script =
+                Script::parse(&ModulePath { mounts: vec![] }, "<test>", src, &reg)
+                    .expect("parse failed");
             let mut event = Value::object();
             let mut state = Value::null();
             let mut global_map = Value::from(hashmap! {});

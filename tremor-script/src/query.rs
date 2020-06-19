@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use crate::ast::{self, Warning};
-use crate::errors::*;
+use crate::errors::{CompilerError, Error, Result};
 use crate::highlighter::{Dumb as DumbHighlighter, Highlighter};
 use crate::lexer;
+use crate::path::ModulePath;
 use crate::pos::Range;
 use crate::prelude::*;
 use rental::rental;
@@ -101,7 +102,14 @@ where
         self.query.suffix()
     }
     /// Parses a string into a query
-    pub fn parse(script: &'script str, reg: &Registry, aggr_reg: &AggrRegistry) -> Result<Self> {
+    pub fn parse(
+        module_path: &ModulePath,
+        file_name: &str,
+        script: &'script str,
+        cus: Vec<ast::CompilationUnit>,
+        reg: &Registry,
+        aggr_reg: &AggrRegistry,
+    ) -> std::result::Result<Self, CompilerError> {
         let mut source = script.to_string();
 
         let mut warnings = vec![];
@@ -110,25 +118,44 @@ where
         // FIXME make lexer EOS tolerant to avoid this kludge
         source.push('\n');
 
-        let query = rentals::Query::try_new(Box::new(source.clone()), |src| {
-            let lexemes: Result<Vec<_>> = lexer::Tokenizer::new(src.as_str()).collect();
-            let filtered_tokens = lexemes?.into_iter().filter(|t| !t.value.is_ignorable());
+        let mut include_stack = lexer::IncludeStack::default();
 
-            let (script, local_count, ws) = crate::parser::g::QueryParser::new()
-                .parse(filtered_tokens)?
-                .up_script(reg, aggr_reg)?;
+        let r = |include_stack: &mut lexer::IncludeStack| -> Result<Self> {
+            let query = rentals::Query::try_new(Box::new(source.clone()), |src: &mut String| {
+                let mut helper = ast::Helper::new(reg, aggr_reg, cus);
+                let cu = include_stack.push(&file_name)?;
+                let lexemes: Vec<_> = lexer::Preprocessor::preprocess(
+                    module_path,
+                    file_name,
+                    src,
+                    cu,
+                    include_stack,
+                )?;
+                let filtered_tokens = lexemes
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .filter(|t| !t.value.is_ignorable());
 
-            warnings = ws;
-            locals = local_count;
-            Ok(script)
-        })
-        .map_err(|e: rental::RentalError<Error, Box<String>>| e.0)?;
+                let (script, local_count, ws) = crate::parser::g::QueryParser::new()
+                    .parse(filtered_tokens)?
+                    .up_script(&mut helper)?;
 
-        Ok(Self {
-            query: Arc::new(query),
-            source,
-            locals,
-            warnings,
+                warnings = ws;
+                locals = local_count;
+                Ok(script)
+            })
+            .map_err(|e: rental::RentalError<Error, Box<String>>| e.0)?;
+
+            Ok(Self {
+                query: Arc::new(query),
+                source,
+                locals,
+                warnings,
+            })
+        }(&mut include_stack);
+        r.map_err(|error| CompilerError {
+            error,
+            cus: include_stack.into_cus(),
         })
     }
 
@@ -137,8 +164,34 @@ where
     pub fn highlight_script_with<H: Highlighter>(script: &str, h: &mut H) -> std::io::Result<()> {
         let mut script = script.to_string();
         script.push('\n');
-        let tokens: Vec<_> = lexer::Tokenizer::new(&script).collect();
-        h.highlight(tokens)
+        let tokens: Vec<_> = lexer::Tokenizer::new(&script)
+            .filter_map(Result::ok)
+            .collect();
+        h.highlight(None, &tokens)
+    }
+
+    /// Preprocessesa and highlights a script with a given highlighter.
+    #[cfg_attr(tarpaulin, skip)]
+    pub fn highlight_preprocess_script_with<H: Highlighter>(
+        file_name: &str,
+        script: &'script str,
+        h: &mut H,
+    ) -> std::io::Result<()> {
+        let mut s = script.to_string();
+        let mut include_stack = lexer::IncludeStack::default();
+        let cu = include_stack.push(&file_name)?;
+
+        let tokens: Vec<_> = lexer::Preprocessor::preprocess(
+            &crate::path::load(),
+            &file_name,
+            &mut s,
+            cu,
+            &mut include_stack,
+        )?
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect();
+        h.highlight(Some(file_name), &tokens)
     }
 
     /// Format an error given a script source.
@@ -150,10 +203,12 @@ where
         let mut script = script.to_string();
         script.push('\n');
 
-        let tokens: Vec<_> = lexer::Tokenizer::new(&script).collect();
+        let tokens: Vec<_> = lexer::Tokenizer::new(&script)
+            .filter_map(Result::ok)
+            .collect();
         match e.context() {
             (Some(Range(start, end)), _) => {
-                h.highlight_runtime_error(tokens, start, end, Some(e.into()))?;
+                h.highlight_runtime_error(None, &tokens, start, end, Some(e.into()))?;
                 h.finalize()
             }
 
@@ -170,13 +225,15 @@ where
         warnings.sort();
         warnings.dedup();
         for w in &warnings {
-            let tokens: Vec<_> = lexer::Tokenizer::new(&self.source).collect();
-            h.highlight_runtime_error(tokens, w.outer.0, w.outer.1, Some(w.into()))?;
+            let tokens: Vec<_> = lexer::Tokenizer::new(&self.source)
+                .filter_map(Result::ok)
+                .collect();
+            h.highlight_runtime_error(None, &tokens, w.outer.0, w.outer.1, Some(w.into()))?;
         }
         h.finalize()
     }
-    /// Formats an error within this script
 
+    /// Formats an error within this script
     pub fn format_error(&self, e: &Error) -> String {
         let mut h = DumbHighlighter::default();
         if self.format_error_with(&mut h, &e).is_ok() {
@@ -199,8 +256,10 @@ mod test {
     fn parse(query: &str) {
         let reg = crate::registry();
         let aggr_reg = crate::aggr_registry();
-        if let Err(e) = Query::parse(query, &reg, &aggr_reg) {
-            eprintln!("{}", e);
+        let module_path = crate::path::load();
+        let cus = vec![];
+        if let Err(e) = Query::parse(&module_path, "test.trickle", query, cus, &reg, &aggr_reg) {
+            eprintln!("{}", e.error());
             assert!(false)
         } else {
             assert!(true)

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::errors::*;
+use crate::errors::Result;
 use tremor_pipeline::FN_REGISTRY;
 use tremor_script::tremor_fn;
 
@@ -20,7 +20,6 @@ use tremor_script::tremor_fn;
 pub fn load() -> Result<()> {
     FN_REGISTRY
         .lock()?
-        //        .or_ok(Error::from("Could not lock function registry"))?
         .insert(tremor_fn!(system::instance(_context) {
             Ok(Value::from(instance!()))
         }));

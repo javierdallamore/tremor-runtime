@@ -2,6 +2,7 @@ define grouper::bucket operator bucket;
 
 define script layer1
 script
+  use std::record;
   let $class = "default";
   let $dimensions = match record::contains(event, "application") of
     case true => event.application
@@ -13,6 +14,7 @@ end;
 
 define script layer2
 script
+  use std::record;
   match record::contains(event, "host") of
     case true => let $dimensions = event.host
     default => null

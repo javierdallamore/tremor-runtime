@@ -24,12 +24,26 @@ pub use codespan::{
     Copy, Clone, Default, Eq, PartialEq, Debug, Hash, Ord, PartialOrd, Serialize, Deserialize,
 )]
 pub struct Location {
+    /// The compilation unit id
+    pub unit_id: usize, // mapping of id -> file ( str )
     /// The Line
     pub line: usize,
     /// The Column
     pub column: usize,
     /// Absolute location in bytes starting from 0
     pub absolute: usize,
+}
+
+impl std::ops::Sub for Location {
+    type Output = Location;
+    fn sub(self, rhs: Location) -> Self::Output {
+        Location {
+            unit_id: self.unit_id,
+            line: self.line.saturating_sub(rhs.line),
+            column: self.column.saturating_sub(rhs.column),
+            absolute: self.absolute.saturating_sub(rhs.absolute),
+        }
+    }
 }
 
 /// A Span with start and end location
@@ -77,17 +91,15 @@ impl Range {
         new.1 = new.1.move_down_lines(lines);
         new
     }
+    /// The compilation unit associated with this range
+    pub fn cu(self) -> usize {
+        self.0.unit_id
+    }
 }
 
 impl From<(Location, Location)> for Range {
     fn from(locs: (Location, Location)) -> Self {
         Self(locs.0, locs.1)
-    }
-}
-pub(crate) fn spanned2<T>(start: Location, end: Location, value: T) -> Spanned<T> {
-    Spanned {
-        span: span(start, end),
-        value,
     }
 }
 
@@ -98,6 +110,21 @@ impl Location {
             line,
             column,
             absolute,
+            unit_id: 0,
+        }
+    }
+
+    pub(crate) fn set_cu(&mut self, cu: usize) {
+        self.unit_id = cu;
+    }
+
+    /// Location for line directives
+    pub fn for_line_directive() -> Self {
+        Self {
+            line: 0,
+            column: 0,
+            absolute: 0,
+            unit_id: 0,
         }
     }
 

@@ -1,12 +1,13 @@
 [package]
 name = "tremor-server"
-version = "0.7.3"
+version = "0.8.0"
 description = "Tremor Runtime Server"
 authors = ["The Tremor Team"]
 edition = "2018"
 license = "Apache-2.0"
 
 [dependencies]
+human-panic="1.0.3"
 tremor-runtime = { path = "../" }
 tremor-api = { path = "../tremor-api" }
 tremor-pipeline = { path = "../tremor-pipeline" }
@@ -15,14 +16,16 @@ serde_yaml = "0.8"
 clap = { version = "2", features = ["yaml"] }
 env_logger = "0.7.1"
 log = "0.4"
-log4rs = "0.11.0"
-async-std = { version = "1", features = ["unstable"] }
-tide = "0.7"
+log4rs = "0.12.0"
+glob = "0.3"
+async-std = { version = "1.6", features = ["unstable"] }
+tide = "0.11"
 mimalloc = { version = "0.1", default-features = false, optional = true }
 jemallocator = { version = "0.3", optional = true }
 snmalloc-rs = { version = "0.2", optional = true }
 
 [features]
-default = ["snmalloc"]
-snmalloc = ["snmalloc-rs"]
-jemalloc = ["jemallocator"]
+default = ["allocator-snmalloc"]
+allocator-snmalloc = ["snmalloc-rs"]
+allocator-jemalloc = ["jemallocator"]
+allocator-mimalloc = ["mimalloc"]
