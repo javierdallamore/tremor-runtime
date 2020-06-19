@@ -30,6 +30,7 @@ use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
 use input::Content;
 use process::ProcessInfo;
 use restore::RestoreState;
+use simd_json::json;
 use std::fs::OpenOptions;
 use std::io::{LineWriter, Write};
 use std::thread::JoinHandle;
@@ -95,9 +96,10 @@ fn onramp_loop(
 
             match content_receiver.recv_timeout(Duration::from_millis(1000)) {
                 Ok(content) => {
-                    let data = serde_json::to_vec(&json!(content));
+                    let data = simd_json::to_vec(&json!(content));
 
                     let mut ingest_ns = nanotime();
+
                     if let Ok(data) = data {
                         send_event(
                             &pipelines,

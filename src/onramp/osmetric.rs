@@ -104,7 +104,7 @@ fn onramp_loop(
         };
 
         for metric in &metrics {
-            let data = serde_json::to_vec(&json!({
+            let data = simd_json::to_vec(&json!({
                 "headers": {"hostname": host_name, "metric": config.metric, "ts": ts},
                 "body": metric,
             }));
