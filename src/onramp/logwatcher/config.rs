@@ -10,7 +10,9 @@ pub struct Config {
     pub source: SourceConfig,
     #[serde(default = "dflt::d_false")]
     pub close_on_done: bool,
-    pub restore_file: Option<String>,
+    #[serde(default = "dflt::d_false")]
+    pub migrate: bool,
+    pub restore_file: String,
 }
 
 impl ConfigImpl for Config {}

@@ -41,7 +41,7 @@ use process::ProcessInfo;
 use restore::RestoreState;
 use simd_json::json;
 use std::fs::OpenOptions;
-use std::io::{LineWriter, Write};
+use std::io::Write;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -79,26 +79,41 @@ fn onramp_loop(
     };
 
     info!("starting logwatcher");
-    let (mut store, mut obj) = if Path::new("/tmp/logwatcher").exists() {
-        read_mmap()?
-    } else {
-        create_mmap()?
-    };
+    let (mut store, mut obj, restore_state) = if Path::new(&config.restore_file).exists() {
+        // is binary
+        if config.migrate {
+            let (store, obj) = create_mmap(config.restore_file.clone())?;
+            let restore_state = RestoreState::from_file(&config.restore_file.clone());
+            let restore_state = match restore_state {
+                Ok(rs) => rs,
+                Err(err) => {
+                    error!("restoring state from {}: {:?}", config.restore_file, err);
+                    RestoreState::empty()
+                }
+            };
 
-    info!("get file consumed state from file");
-    let restore_state = match &config.restore_file {
-        Some(path) => match RestoreState::from_file(&path) {
-            Ok(rs) => rs,
-            Err(err) => {
-                error!("restoring state from {}: {:?}", path, err);
-                RestoreState::empty()
-            }
-        },
-        None => RestoreState::empty(),
+            (store, obj, restore_state)
+        } else {
+            let (store, obj) = read_mmap(config.restore_file.clone())?;
+            let restore_state = RestoreState::from_json(obj.encode());
+
+            let restore_state = match restore_state {
+                Ok(rs) => rs,
+                Err(err) => {
+                    error!("restoring state from {}: {:?}", config.restore_file, err);
+                    RestoreState::empty()
+                }
+            };
+
+            (store, obj, restore_state)
+        }
+    } else {
+        let (store, obj) = create_mmap(config.restore_file.clone())?;
+        (store, obj, RestoreState::empty())
     };
 
     if let Ok(source_spec) = config.source.to_source_spec() {
-        let (walker_sender, source_sender, join_handles) =
+        let (walker_sender, source_sender, _join_handles) =
             start_all(content_sender, source_spec, restore_state);
 
         loop {
@@ -128,7 +143,7 @@ fn onramp_loop(
                         id += 1;
 
                         if let Err(e) = obj.insert(content.file_path, handler_info.to_line()) {
-                            println!("Could not insert into obj: {}", e);
+                            warn!("Could not insert into obj: {}", e);
                         }
 
                         let string = obj.encode();
@@ -162,7 +177,6 @@ fn onramp_loop(
             Err(err) => error!("error sending stop signal to source: {}", err),
         }
 
-        wait_all(join_handles, config.restore_file.clone());
         info!("all threads finished, exiting");
     }
     Ok(())
@@ -242,75 +256,11 @@ fn start_all(
     (walker_msg_sender, source_sender.clone(), join_handles)
 }
 
-struct LogWrite;
-
-impl LogWrite {
-    fn new() -> LogWrite {
-        LogWrite {}
-    }
-}
-
-impl std::io::Write for LogWrite {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match std::str::from_utf8(buf) {
-            Ok(s) => {
-                info!("{}", s);
-                Ok(buf.len())
-            }
-            Err(_) => Ok(0),
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn wait_all(join_handles: Vec<JoinHandle<ProcessInfo>>, restore_path: Option<String>) {
-    let mut writer = match restore_path {
-        Some(file_path) => match OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&file_path)
-        {
-            Ok(write_file) => LineWriter::new(Box::new(write_file) as Box<dyn Write>),
-            Err(err) => {
-                error!("can't open restore file {}: {}", file_path, err);
-                LineWriter::new(Box::new(LogWrite::new()) as Box<dyn Write>)
-            }
-        },
-        None => LineWriter::new(Box::new(LogWrite::new()) as Box<dyn Write>),
-    };
-    for handle in join_handles {
-        match handle.join() {
-            Ok(ProcessInfo::Nothing) => {
-                info!("no process info");
-            }
-            Ok(ProcessInfo::HandlerInfo(infos)) => {
-                for info in infos {
-                    if let Some(line) = info.to_line() {
-                        match writer.write_all(line.as_bytes()) {
-                            Ok(_) => {
-                                info!("restore written for file {}", info.path);
-                            }
-                            Err(err) => {
-                                error!("{}", err);
-                            }
-                        }
-                    }
-                }
-            }
-            Err(err) => error!("stop error: {:?}", err),
-        };
-    }
-}
-
-fn read_mmap() -> Result<(MmapMut, simd_json::value::owned::Value)> {
+fn read_mmap(restore_file: String) -> Result<(MmapMut, simd_json::value::owned::Value)> {
     let file = OpenOptions::new()
         .write(true)
         .read(true)
-        .open("/tmp/logwatcher.json")?;
+        .open(restore_file)?;
 
     let mmap = unsafe { MmapOptions::new().map(&file)? };
     let mut store = mmap.make_mut()?;
@@ -321,16 +271,18 @@ fn read_mmap() -> Result<(MmapMut, simd_json::value::owned::Value)> {
     array.copy_from_slice(byteslen);
 
     let len = usize::from_be_bytes(array);
+    info!("READ MMAP LEN {}", len);
+
     let mut bytes = &mut store[8..(len + 8)];
     let obj = simd_json::to_owned_value(&mut bytes)?;
 
     Ok((store, obj))
 }
 
-fn create_mmap() -> Result<(MmapMut, simd_json::value::owned::Value)> {
+fn create_mmap(restore_file: String) -> Result<(MmapMut, simd_json::value::owned::Value)> {
     let obj = simd_json::OwnedValue::object();
     let config = ramp::Config {
-        path: "/tmp/logwatcher.json".to_string(),
+        path: restore_file,
         size: 4096,
     };
 
@@ -357,141 +309,13 @@ fn create_mmap() -> Result<(MmapMut, simd_json::value::owned::Value)> {
 #[cfg(test)]
 mod tests {
     use crate::errors::Result;
-    use crate::ramp;
-    use memmap::MmapOptions;
-    use simd_json::prelude::*;
     use std::fs;
-    use std::fs::OpenOptions;
-    use std::io::Write;
-    //use std::ops::DerefMut;
-    use std::path::Path;
 
     #[test]
-    #[ignore]
-    fn from_config() -> Result<()> {
-        let mut obj = simd_json::OwnedValue::object();
-        let key = "/a/path/to/a/file".to_string();
-        let value = "HandlerInfo:10101020:1002:10010".to_string();
-        if let Err(e) = obj.insert(key, value) {
-            println!("Could not insert into obj: {}", e);
-        }
-
-        let config = ramp::Config {
-            path: "/tmp/logwatcher.json".to_string(),
-            size: 4096,
-        };
-
-        let p = Path::new(&config.path);
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(p)?;
-        file.set_len(config.size as u64)?;
-        let _len = config.size as usize;
-        let string = obj.encode();
-        let bytes = string.as_bytes();
-        let end = bytes.len();
-
-        let result = [&end.to_be_bytes(), bytes].concat();
-        file.write_all(&result)?;
-
-        let _store = unsafe { MmapOptions::new().map(&file)? };
-        Ok({})
-    }
-
-    #[test]
-    fn test_read_f() -> Result<()> {
-        let key = "/a/path/to/a/file".to_string();
-        let value = "HandlerInfo:10101020:1002:10010".to_string();
-        let file = OpenOptions::new()
-            .write(true)
-            .read(true)
-            .open("/tmp/logwatcher.json")?;
-
-        let mmap = unsafe { MmapOptions::new().map(&file)? };
-        let mut mmapmut = mmap.make_mut()?;
-
-        let byteslen = &mut mmapmut[0..8];
-        let mut array = [0; 8];
-        let byteslen = &byteslen[..array.len()];
-        array.copy_from_slice(byteslen);
-
-        let len = usize::from_be_bytes(array);
-        assert_eq!(55, len);
-
-        let mut bytes = &mut mmapmut[8..(len + 8)];
-        let obj = simd_json::to_owned_value(&mut bytes)?;
-        println!("{:?}", obj.to_value());
-
-        if let Some(v) = obj.get(&key) {
-            assert_eq!(v.to_string(), value);
-        }
-        Ok({})
-    }
-
-    #[test]
-    #[ignore]
-    fn test_create() -> Result<()> {
-        let key = "/a/path/to/a/file".to_string();
-        let value = "HandlerInfo:10101020:1002:10010".to_string();
-        let mut obj = simd_json::OwnedValue::object();
-        let size = 4096;
-
-        let cache_config = ramp::Config {
-            path: "/tmp/logwatcher.json".to_string(),
-            size: size,
-        };
-
-        if let Err(e) = obj.insert(key, value) {
-            println!("Could not insert into obj: {}", e);
-        }
-        if let Err(e) = obj.insert("len".to_string(), 123110) {
-            println!("Could not insert into obj: {}", e);
-        }
-
-        let string = obj.encode();
-        let bytes = string.as_bytes();
-        let len = bytes.len();
-
-        let _cache = match ramp::lookup("mmap_file", Some(cache_config), &obj) {
-            Ok(v) => v,
-            Err(e) => return Err(e),
-        };
-
-        let size_content = format!("{:?}", len);
-        fs::write("/tmp/logwatcher.size.txt", size_content.as_bytes())
-            .expect("Unable to write file");
-
-        Ok({})
-    }
-
-    #[test]
-    #[ignore]
-    fn test_read() -> Result<()> {
-        let key = "/a/path/to/a/file".to_string();
-        let value = "HandlerInfo:10101020:1002:10010".to_string();
-
-        /*
-        let file_len = OpenOptions::new()
-            .read(true)
-            .open("/tmp/logwatcher.len.txt")?;
-        let val = fs::read(file_len)?;*/
-        let len = 55;
-
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/tmp/logwatcher.json")?;
-
-        let mmap = unsafe { MmapOptions::new().map(&file)? };
-        let mut mmap = mmap.make_mut()?;
-
-        let mut bytes = &mut mmap[..len];
-        let obj = simd_json::to_owned_value(&mut bytes)?;
-        if let Some(v) = obj.get(&key) {
-            assert_eq!(v.to_string(), value);
-        }
+    fn check_files() -> Result<()> {
+        assert_eq!(fs::metadata("/tmp/noexists").is_ok(), true);
+        let logwatcher_restore = fs::metadata("/tmp/logwatcher.json");
+        assert_eq!(logwatcher_restore.is_ok(), true);
         Ok({})
     }
 }

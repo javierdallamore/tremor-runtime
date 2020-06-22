@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 
-
 #[derive(Debug)]
 pub struct RestoreState {
     pub handler_infos: HashMap<String, HandlerInfo>,
@@ -50,6 +49,23 @@ impl RestoreState {
                 Err(Error::NotFound(path.to_string()))
             }
         }
+    }
+
+    pub fn from_json(mut restore_data: String) -> Result<RestoreState, Error> {
+        let mut handler_infos = HashMap::new();
+
+        let restore_data_kv: HashMap<&str, &str> = simd_json::from_str(&mut restore_data).unwrap();
+        for (_k, v) in restore_data_kv.iter() {
+            match ProcessInfoItem::from_line(&v) {
+                ProcessInfoItem::HandlerInfo(handler_info) => {
+                    handler_infos.insert(handler_info.path.clone(), handler_info);
+                }
+                ProcessInfoItem::Unk(unk_line) => {
+                    debug!("Unknown RestoreState line: {}", unk_line);
+                }
+            }
+        }
+        Ok(RestoreState { handler_infos })
     }
 
     pub fn get_handler_state(&self, path: &str) -> Option<&HandlerInfo> {
