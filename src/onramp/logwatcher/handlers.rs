@@ -1,6 +1,7 @@
 use super::config::LineRegex;
 use super::input::Content;
 use super::input::{ContentChecksum, Error, FileState, MsgInput};
+use super::process::HandlerInfo;
 use super::process::ProcessInfo;
 use super::restore::RestoreState;
 use crossbeam_channel::Receiver;
@@ -44,7 +45,7 @@ pub struct Handlers {
     max_lines: u32,
     line_regex: Vec<LogRegex>,
     restore_state: RestoreState,
-    content_sender: Sender<Content>,
+    content_sender: Sender<(Content, HandlerInfo)>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,7 +59,7 @@ impl Handlers {
         restore_state: RestoreState,
         max_lines: u32,
         line_regex: Vec<LineRegex>,
-        content_sender: Sender<Content>,
+        content_sender: Sender<(Content, HandlerInfo)>,
     ) -> Handlers {
         let line_regex: Vec<LogRegex> = line_regex
             .into_iter()
@@ -152,7 +153,7 @@ impl Handlers {
     }
 
     pub fn start(
-        content_sender: Sender<Content>,
+        content_sender: Sender<(Content, HandlerInfo)>,
         source_receiver: Receiver<Msg>,
         recv_timeout: Duration,
         restore_state: RestoreState,

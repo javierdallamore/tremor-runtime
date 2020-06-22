@@ -66,7 +66,7 @@ pub struct FileState {
     // state and reopen to start reading from the new one
     reset_on_eof: bool,
     file_lines: Vec<String>,
-    content_sender: Sender<Content>,
+    content_sender: Sender<(Content, HandlerInfo)>,
 }
 
 #[derive(Debug)]
@@ -124,7 +124,7 @@ impl FileState {
         modified: SystemTime,
         created: SystemTime,
         checksum: ContentChecksum,
-        content_sender: Sender<Content>,
+        content_sender: Sender<(Content, HandlerInfo)>,
     ) -> FileState {
         FileState {
             path,
@@ -194,7 +194,7 @@ impl FileState {
 
                     has_more = true;
                     line_count += 1;
-                    match self.content_sender.send(content) {
+                    match self.content_sender.send((content, self.to_info())) {
                         Ok(_) => {}
                         Err(error) => {
                             error!("error sending content: {}", error);
