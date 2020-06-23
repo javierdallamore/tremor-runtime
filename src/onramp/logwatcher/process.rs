@@ -129,7 +129,7 @@ impl HandlerInfo {
                 .as_millis();
 
             Some(format!(
-                "HandlerInfo:1:{}:{}:{}:{}:{}:{}:{}:{}\n",
+                "HandlerInfo:1:{}:{}:{}:{}:{}:{}:{}:{}",
                 self.len,
                 self.offset,
                 modified_millis_since_epoch,
