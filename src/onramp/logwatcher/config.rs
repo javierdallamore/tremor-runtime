@@ -1,5 +1,6 @@
 use super::path::{MatchRule, Matcher, ParseError, RuleAction};
 use crate::dflt;
+use crate::ramp;
 use std::time::Duration;
 
 use crate::utils::ConfigImpl;
@@ -12,7 +13,7 @@ pub struct Config {
     pub close_on_done: bool,
     #[serde(default = "dflt::d_false")]
     pub migrate: bool,
-    pub restore_file: String,
+    pub restore_file: ramp::Config,
 }
 
 impl ConfigImpl for Config {}

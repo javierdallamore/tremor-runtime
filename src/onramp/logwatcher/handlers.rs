@@ -16,6 +16,7 @@ pub enum Msg {
     ModifiedChange(String, u64, SystemTime),
     SizeSmaller(String, u64, SystemTime),
     CreatedChange(String, u64, SystemTime),
+    #[allow(dead_code)]
     Stop,
 }
 

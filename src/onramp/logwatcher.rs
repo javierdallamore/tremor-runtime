@@ -79,15 +79,33 @@ fn onramp_loop(
     };
 
     info!("starting logwatcher");
-    let (mut store, mut obj, restore_state) = if Path::new(&config.restore_file).exists() {
+    let (mut store, mut obj, restore_state) = if Path::new(&config.restore_file.path).exists() {
         // is binary
         if config.migrate {
-            let (store, obj) = create_mmap(config.restore_file.clone())?;
-            let restore_state = RestoreState::from_file(&config.restore_file.clone());
+            let (mut store, mut obj) = create_mmap(config.restore_file.clone())?;
+            let restore_state = RestoreState::from_file(&config.restore_file.path.clone());
             let restore_state = match restore_state {
-                Ok(rs) => rs,
+                Ok(rs) => {
+                    for (file_path, handler_info) in &rs.handler_infos {
+                        if let Err(e) = obj.insert(file_path, handler_info.to_line()) {
+                            warn!("Could not insert into obj: {}", e);
+                        }
+                    }
+                    let string = obj.encode();
+                    let bytes = string.as_bytes();
+                    let end = bytes.len();
+
+                    let result = [&end.to_be_bytes(), bytes].concat();
+
+                    store.deref_mut().write_all(&result)?;
+
+                    rs
+                }
                 Err(err) => {
-                    error!("restoring state from {}: {:?}", config.restore_file, err);
+                    error!(
+                        "restoring state from {}: {:?}",
+                        config.restore_file.path, err
+                    );
                     RestoreState::empty()
                 }
             };
@@ -100,7 +118,10 @@ fn onramp_loop(
             let restore_state = match restore_state {
                 Ok(rs) => rs,
                 Err(err) => {
-                    error!("restoring state from {}: {:?}", config.restore_file, err);
+                    error!(
+                        "restoring state from {}: {:?}",
+                        config.restore_file.path, err
+                    );
                     RestoreState::empty()
                 }
             };
@@ -112,8 +133,10 @@ fn onramp_loop(
         (store, obj, RestoreState::empty())
     };
 
+    info!("Store and obj loaded");
+
     if let Ok(source_spec) = config.source.to_source_spec() {
-        let (walker_sender, source_sender, _join_handles) =
+        let (_walker_sender, _source_sender, _join_handles) =
             start_all(content_sender, source_spec, restore_state);
 
         loop {
@@ -142,6 +165,7 @@ fn onramp_loop(
                         );
                         id += 1;
 
+                        info!("Writting first row");
                         if let Err(e) = obj.insert(content.file_path, handler_info.to_line()) {
                             warn!("Could not insert into obj: {}", e);
                         }
@@ -158,26 +182,9 @@ fn onramp_loop(
                 Err(RecvTimeoutError::Timeout) => trace!("recv timeout"),
                 Err(error) => {
                     error!("{}", error);
-                    // TODO until I discover how to subscribe to process kill and call the methods bellow
-                    break;
                 }
             }
         }
-
-        // TODO I do not know how where stop all and store file state before closing
-        info!("stopping everything and saving state");
-
-        match walker_sender.send(path::WalkerMsg::Stop) {
-            Ok(_) => info!("ok sending stop signal to walker"),
-            Err(err) => error!("Error sending stop signal to walker: {}", err),
-        }
-
-        match source_sender.send(handlers::Msg::Stop) {
-            Ok(_) => info!("ok sending stop signal to source"),
-            Err(err) => error!("error sending stop signal to source: {}", err),
-        }
-
-        info!("all threads finished, exiting");
     }
     Ok(())
 }
@@ -256,11 +263,13 @@ fn start_all(
     (walker_msg_sender, source_sender.clone(), join_handles)
 }
 
-fn read_mmap(restore_file: String) -> Result<(MmapMut, simd_json::value::owned::Value)> {
+fn read_mmap(config: ramp::Config) -> Result<(MmapMut, simd_json::value::owned::Value)> {
+    info!("Reading MMAP from {}", config.path);
     let file = OpenOptions::new()
         .write(true)
         .read(true)
-        .open(restore_file)?;
+        .open(config.path)?;
+    file.set_len(config.size as u64)?;
 
     let mmap = unsafe { MmapOptions::new().map(&file)? };
     let mut store = mmap.make_mut()?;
@@ -271,7 +280,6 @@ fn read_mmap(restore_file: String) -> Result<(MmapMut, simd_json::value::owned::
     array.copy_from_slice(byteslen);
 
     let len = usize::from_be_bytes(array);
-    info!("READ MMAP LEN {}", len);
 
     let mut bytes = &mut store[8..(len + 8)];
     let obj = simd_json::to_owned_value(&mut bytes)?;
@@ -279,13 +287,9 @@ fn read_mmap(restore_file: String) -> Result<(MmapMut, simd_json::value::owned::
     Ok((store, obj))
 }
 
-fn create_mmap(restore_file: String) -> Result<(MmapMut, simd_json::value::owned::Value)> {
+fn create_mmap(config: ramp::Config) -> Result<(MmapMut, simd_json::value::owned::Value)> {
+    info!("CREATING MMAP in {}", config.path);
     let obj = simd_json::OwnedValue::object();
-    let config = ramp::Config {
-        path: restore_file,
-        size: 4096,
-    };
-
     let p = Path::new(&config.path);
     let mut file = OpenOptions::new()
         .read(true)
