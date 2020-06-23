@@ -61,7 +61,7 @@ impl RestoreState {
                     handler_infos.insert(handler_info.path.clone(), handler_info);
                 }
                 ProcessInfoItem::Unk(unk_line) => {
-                    debug!("Unknown RestoreState line: {}", unk_line);
+                    debug!("unknown restore state line: {}", unk_line);
                 }
             }
         }

@@ -133,8 +133,6 @@ fn onramp_loop(
         (store, obj, RestoreState::empty())
     };
 
-    info!("Store and obj loaded");
-
     if let Ok(source_spec) = config.source.to_source_spec() {
         let (_walker_sender, _source_sender, _join_handles) =
             start_all(content_sender, source_spec, restore_state);
@@ -165,7 +163,6 @@ fn onramp_loop(
                         );
                         id += 1;
 
-                        info!("Writting first row");
                         if let Err(e) = obj.insert(content.file_path, handler_info.to_line()) {
                             warn!("Could not insert into obj: {}", e);
                         }
@@ -266,7 +263,6 @@ fn start_all(
 }
 
 fn read_mmap(config: ramp::Config) -> Result<(MmapMut, simd_json::value::owned::Value)> {
-    info!("Reading MMAP from {}", config.path);
     let file = OpenOptions::new()
         .write(true)
         .read(true)
@@ -290,7 +286,6 @@ fn read_mmap(config: ramp::Config) -> Result<(MmapMut, simd_json::value::owned::
 }
 
 fn create_mmap(config: ramp::Config) -> Result<(MmapMut, simd_json::value::owned::Value)> {
-    info!("CREATING MMAP in {}", config.path);
     let obj = simd_json::OwnedValue::object();
     let p = Path::new(&config.path);
     let mut file = OpenOptions::new()

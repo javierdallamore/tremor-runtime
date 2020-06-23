@@ -13,28 +13,34 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug)]
 pub enum Msg {
-    ModifiedChange(String, u64, SystemTime),
-    SizeSmaller(String, u64, SystemTime),
-    CreatedChange(String, u64, SystemTime),
+    ModifiedChange(String, u64, SystemTime, SystemTime),
+    SizeSmaller(String, u64, SystemTime, SystemTime),
+    CreatedChange(String, u64, SystemTime, SystemTime),
     #[allow(dead_code)]
     Stop,
 }
 
 impl Msg {
-    pub fn info(&self) -> Option<(&str, u64, SystemTime)> {
+    pub fn info(&self) -> Option<(&str, u64, SystemTime, SystemTime)> {
         match self {
-            Msg::ModifiedChange(path, len, modified) => Some((path, *len, *modified)),
-            Msg::SizeSmaller(path, len, modified) => Some((path, *len, *modified)),
-            Msg::CreatedChange(path, len, modified) => Some((path, *len, *modified)),
+            Msg::ModifiedChange(path, len, created, modified) => {
+                Some((path, *len, *created, *modified))
+            }
+            Msg::SizeSmaller(path, len, created, modified) => {
+                Some((path, *len, *created, *modified))
+            }
+            Msg::CreatedChange(path, len, created, modified) => {
+                Some((path, *len, *created, *modified))
+            }
             Msg::Stop => None,
         }
     }
 
     pub fn is_truncated_or_rotated(&self) -> bool {
         match self {
-            Msg::SizeSmaller(_path, _len, _modified) => true,
-            Msg::CreatedChange(_path, _len, _modified) => true,
-            Msg::ModifiedChange(_path, _len, _modified) => false,
+            Msg::SizeSmaller(_path, _len, _created, _modified) => true,
+            Msg::CreatedChange(_path, _len, _created, _modified) => true,
+            Msg::ModifiedChange(_path, _len, _created, _modified) => false,
             Msg::Stop => false,
         }
     }
@@ -112,8 +118,8 @@ impl Handlers {
 
         if offset > 0 {
             info!(
-                "restoring {} with offset: {}, modified: {:?}",
-                path, offset, modified
+                "restoring {} with offset: {}, modified: {:?}, created: {:?}",
+                path, offset, modified, created
             );
         }
         file_state.seek(offset);
@@ -122,11 +128,12 @@ impl Handlers {
 
     pub fn handle(&mut self, msg: Msg) -> Result<(), Error<MsgInput>> {
         match msg.info() {
-            Some((path, len, modified)) => {
+            Some((path, len, created, modified)) => {
                 match self.handlers.get_mut(path) {
                     Some(file_state) => {
                         file_state.len = len;
                         file_state.modified = modified;
+                        file_state.created = created;
                         if msg.is_truncated_or_rotated() {
                             file_state.mark_to_reset_on_eof();
                         }
@@ -136,6 +143,7 @@ impl Handlers {
                         let mut file_state = self.get_handler(&path);
                         file_state.len = len;
                         file_state.modified = modified;
+                        file_state.created = created;
                         if msg.is_truncated_or_rotated() {
                             file_state.mark_to_reset_on_eof();
                         }

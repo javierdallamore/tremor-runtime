@@ -230,7 +230,6 @@ impl FileState {
                         if self.buffer.ends_with("\n") {
                             self.buffer.pop();
                             let content = self.buffer.clone();
-                            self.file_lines.push(self.buffer.clone());
 
                             let content_offset = self.offset - (content.len() + 1) as u64;
                             self.checksum = ContentChecksum::Read {
@@ -238,14 +237,16 @@ impl FileState {
                                 offset: content_offset,
                             };
 
-                            let lines_joined = self.file_lines.join("\n");
-
-                            let mut result = String::from("");
-                            let mut keep_last_line = false;
-
                             if line_regex.is_empty() {
-                                result = self.buffer.clone();
+                                let result = self.buffer.clone();
+                                self.buffer.clear();
+                                Ok(Some(result))
                             } else {
+                                //TODO find a better way for multiple lines accumulator
+                                let mut result = String::from("");
+                                let mut keep_last_line = false;
+                                self.file_lines.push(self.buffer.clone());
+                                let lines_joined = self.file_lines.join("\n");
                                 'outer: for regex in &line_regex {
                                     for mat in regex.regex.find_iter(&lines_joined) {
                                         keep_last_line = regex.keep_last_line;
@@ -253,21 +254,22 @@ impl FileState {
                                         break 'outer;
                                     }
                                 }
-                            }
-                            if !result.is_empty() {
-                                self.file_lines.clear();
-                                if keep_last_line {
-                                    self.file_lines = vec![self.buffer.clone()];
+
+                                if !result.is_empty() {
+                                    self.file_lines.clear();
+                                    if keep_last_line {
+                                        self.file_lines = vec![self.buffer.clone()];
+                                    }
                                 }
-                            }
 
-                            // remove lines while file_lines > max_lines
-                            while self.file_lines.len() > max_lines {
-                                self.file_lines.remove(0);
-                            }
+                                // remove lines while file_lines > max_lines
+                                while self.file_lines.len() > max_lines {
+                                    self.file_lines.remove(0);
+                                }
 
-                            self.buffer.clear();
-                            Ok(Some(result))
+                                self.buffer.clear();
+                                Ok(Some(result))
+                            }
                         } else {
                             Ok(None)
                         }

@@ -117,23 +117,23 @@ impl HandlerInfo {
             // don't serialize info that doesn't have a hash
             None
         } else {
-            let modified_millis_since_epoch = self
+            let modified_nanos_since_epoch = self
                 .modified
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
-                .as_millis();
-            let created_millis_since_epoch = self
+                .as_nanos();
+            let created_nanos_since_epoch = self
                 .created
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
-                .as_millis();
+                .as_nanos();
 
             Some(format!(
                 "HandlerInfo:1:{}:{}:{}:{}:{}:{}:{}:{}",
                 self.len,
                 self.offset,
-                modified_millis_since_epoch,
-                created_millis_since_epoch,
+                modified_nanos_since_epoch,
+                created_nanos_since_epoch,
                 self.hash,
                 self.hash_offset,
                 self.hash_content_len,
@@ -173,12 +173,12 @@ impl ProcessInfoItem {
                     let modified_millis_since_epoch =
                         modified_millis_since_epoch_str.parse::<u64>().unwrap();
                     let modified = UNIX_EPOCH
-                        .checked_add(Duration::from_millis(modified_millis_since_epoch))
+                        .checked_add(Duration::from_nanos(modified_millis_since_epoch))
                         .unwrap();
                     let created_millis_since_epoch =
                         created_millis_since_epoch_str.parse::<u64>().unwrap();
                     let created = UNIX_EPOCH
-                        .checked_add(Duration::from_millis(created_millis_since_epoch))
+                        .checked_add(Duration::from_nanos(created_millis_since_epoch))
                         .unwrap();
                     let hash_offset = hash_offset_str.parse::<u64>().unwrap();
                     let hash_content_len = hash_content_len_str.parse::<usize>().unwrap();
