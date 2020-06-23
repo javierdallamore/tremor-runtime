@@ -14,6 +14,7 @@ pub struct Config {
     #[serde(default = "dflt::d_false")]
     pub migrate: bool,
     pub restore_file: ramp::Config,
+    pub throttle: u64,
 }
 
 impl ConfigImpl for Config {}

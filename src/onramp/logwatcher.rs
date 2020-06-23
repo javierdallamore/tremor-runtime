@@ -15,7 +15,7 @@
 use crate::onramp::prelude::*;
 use serde_yaml::Value;
 //use std::process;
-use std::thread;
+use std::{thread, time};
 
 use crate::errors::Result;
 use crate::ramp;
@@ -146,7 +146,7 @@ fn onramp_loop(
                 PipeHandlerResult::Normal => (),
             }
 
-            match content_receiver.recv_timeout(Duration::from_millis(1000)) {
+            match content_receiver.recv_timeout(Duration::from_millis(100)) {
                 Ok((content, handler_info)) => {
                     let data = simd_json::to_vec(&json!(content));
 
@@ -177,11 +177,13 @@ fn onramp_loop(
                         let result = [&end.to_be_bytes(), bytes].concat();
 
                         store.deref_mut().write_all(&result)?;
+
+                        thread::sleep(time::Duration::from_millis(config.throttle));
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => trace!("recv timeout"),
                 Err(error) => {
-                    error!("{}", error);
+                    error!("Request error {}", error);
                 }
             }
         }
