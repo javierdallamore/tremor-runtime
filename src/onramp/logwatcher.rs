@@ -69,7 +69,7 @@ fn onramp_loop(
 ) -> Result<()> {
     let mut pipelines: Vec<(TremorURL, pipeline::Addr)> = Vec::new();
     let mut id = 0;
-    let (content_sender, content_receiver) = bounded(0);
+    let (content_sender, content_receiver) = bounded(100);
 
     let origin_uri = tremor_pipeline::EventOriginUri {
         scheme: "tremor-logwatcher".to_string(),
@@ -163,9 +163,21 @@ fn onramp_loop(
                         );
                         id += 1;
 
-                        if let Err(e) = obj.insert(content.file_path, handler_info.to_line()) {
-                            warn!("Could not insert into obj: {}", e);
-                        }
+                        match handler_info.to_line() {
+                            Some(handler_info_line) => {
+                                if let Err(e) =
+                                    obj.insert(content.file_path.clone(), handler_info_line.clone())
+                                {
+                                    error!(
+                                        "could not store restore info for {} {:?} {}",
+                                        content.file_path, handler_info_line, e
+                                    );
+                                }
+                            }
+                            None => {
+                                error!("could not store restore info for {}", content.file_path)
+                            }
+                        };
 
                         let string = obj.encode();
                         let bytes = string.as_bytes();
@@ -175,7 +187,9 @@ fn onramp_loop(
 
                         store.deref_mut().write_all(&result)?;
 
-                        thread::sleep(time::Duration::from_millis(config.throttle));
+                        if config.throttle > 0 {
+                            thread::sleep(time::Duration::from_millis(config.throttle));
+                        }
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => trace!("recv timeout"),
