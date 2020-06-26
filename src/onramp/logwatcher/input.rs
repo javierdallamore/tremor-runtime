@@ -19,6 +19,7 @@ pub struct Content {
     pub file_offset: u64,
     pub line_consumed_ts: u64,
     pub line: String,
+    pub id: String,
 }
 
 #[derive(Debug)]
@@ -174,22 +175,35 @@ impl FileState {
                 Ok(Some(line)) => {
                     let now = (nanotime() / 1_000_000) as u64;
 
-                    let content = Content {
-                        hostname: hostname(),
-                        file_path: self.path.clone(),
-                        file_modified_ts: self
+                    let file_modified_ts = self
                             .modified
                             .duration_since(UNIX_EPOCH)
                             .expect("time went backwards")
-                            .as_millis() as u64,
-                        file_created_ts: self
+                            .as_millis() as u64;
+                    let file_created_ts = self
                             .created
                             .duration_since(UNIX_EPOCH)
                             .expect("time went backwards")
-                            .as_millis() as u64,
+                            .as_millis() as u64;
+
+                    let id_str = format!(
+                        "{}{}{}{}{}",
+                        file_created_ts,
+                        hostname(),
+                        self.path,
+                        self.offset,
+                        line
+                    );
+
+                    let content = Content {
+                        hostname: hostname(),
+                        file_path: self.path.clone(),
+                        file_modified_ts: file_modified_ts,
+                        file_created_ts: file_created_ts,
                         file_offset: self.offset,
                         line_consumed_ts: now,
                         line: line,
+                        id: hash_str(&id_str),
                     };
 
                     has_more = true;

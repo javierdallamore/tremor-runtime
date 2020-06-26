@@ -10,6 +10,7 @@ pub struct RestoreState {
 
 #[derive(Debug)]
 pub enum Error {
+    #[allow(dead_code)]
     NotFound(String),
 }
 
@@ -20,6 +21,7 @@ impl RestoreState {
         }
     }
 
+    #[allow(dead_code)]
     pub fn from_file(path: &str) -> Result<RestoreState, Error> {
         let mut handler_infos = HashMap::new();
         match File::open(path) {

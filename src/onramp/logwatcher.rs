@@ -22,6 +22,7 @@ use crate::ramp;
 use memmap::MmapMut;
 use memmap::MmapOptions;
 use simd_json::prelude::*;
+use std::collections::HashMap;
 use std::ops::DerefMut;
 use std::path::Path;
 
@@ -43,7 +44,7 @@ use simd_json::json;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct LogWatcher {
     pub config: Config,
@@ -80,68 +81,63 @@ fn onramp_loop(
 
     info!("starting logwatcher");
     let (mut store, mut obj, restore_state) = if Path::new(&config.restore_file.path).exists() {
-        // is binary
-        if config.migrate {
-            let (mut store, mut obj) = create_mmap(config.restore_file.clone())?;
-            let restore_state = RestoreState::from_file(&config.restore_file.path.clone());
-            let restore_state = match restore_state {
-                Ok(rs) => {
-                    for (file_path, handler_info) in &rs.handler_infos {
-                        if let Err(e) = obj.insert(file_path, handler_info.to_line()) {
-                            warn!("Could not insert into obj: {}", e);
-                        }
-                    }
-                    let string = obj.encode();
-                    let bytes = string.as_bytes();
-                    let end = bytes.len();
+        let (store, obj) = read_mmap(config.restore_file.clone())?;
 
-                    let result = [&end.to_be_bytes(), bytes].concat();
+        let restore_state = RestoreState::from_json(obj.encode());
 
-                    store.deref_mut().write_all(&result)?;
+        let restore_state = match restore_state {
+            Ok(rs) => rs,
+            Err(err) => {
+                error!(
+                    "restoring state from {}: {:?}",
+                    config.restore_file.path, err
+                );
+                RestoreState::empty()
+            }
+        };
 
-                    rs
-                }
-                Err(err) => {
-                    error!(
-                        "restoring state from {}: {:?}",
-                        config.restore_file.path, err
-                    );
-                    RestoreState::empty()
-                }
-            };
-
-            (store, obj, restore_state)
-        } else {
-            let (store, obj) = read_mmap(config.restore_file.clone())?;
-            let restore_state = RestoreState::from_json(obj.encode());
-
-            let restore_state = match restore_state {
-                Ok(rs) => rs,
-                Err(err) => {
-                    error!(
-                        "restoring state from {}: {:?}",
-                        config.restore_file.path, err
-                    );
-                    RestoreState::empty()
-                }
-            };
-
-            (store, obj, restore_state)
-        }
+        (store, obj, restore_state)
     } else {
         let (store, obj) = create_mmap(config.restore_file.clone())?;
         (store, obj, RestoreState::empty())
     };
 
+    let eviction_interval = Duration::from_secs(60);
     if let Ok(source_spec) = config.source.to_source_spec() {
         let (_walker_sender, _source_sender, _join_handles) =
             start_all(content_sender, source_spec, restore_state);
 
+        let mut last_eviction: Option<Instant> = None;
         loop {
             match task::block_on(handle_pipelines(&rx, &mut pipelines, &mut metrics_reporter))? {
                 PipeHandlerResult::Retry => continue,
                 PipeHandlerResult::Terminate => return Ok(()),
                 PipeHandlerResult::Normal => (),
+            }
+
+            // TODO clear obj of deleted files
+            if last_eviction.is_none() || last_eviction.unwrap().elapsed() > eviction_interval {
+                info!("checking files to remove from restore");
+                let mut restore_data = obj.encode();
+                let restore_data_kv: HashMap<&str, &str> =
+                    simd_json::from_str(&mut restore_data).unwrap();
+                for (file_path, _) in restore_data_kv.iter() {
+                    if !Path::new(&file_path).exists() {
+                        match obj.remove(*file_path) {
+                            Ok(v) => info!("removed file {} from restore because was deleted {:?}", file_path, v),
+                            Err(_) => error!("couldn't removed file {} from restore", file_path),
+                        };
+                    }
+                }
+                let restore_data = obj.encode();
+                let bytes = restore_data.as_bytes();
+                let end = bytes.len();
+
+                let result = [&end.to_be_bytes(), bytes].concat();
+
+                store.deref_mut().write_all(&result)?;
+
+                last_eviction = Some(Instant::now());
             }
 
             match content_receiver.recv_timeout(Duration::from_millis(100)) {
@@ -179,8 +175,8 @@ fn onramp_loop(
                             }
                         };
 
-                        let string = obj.encode();
-                        let bytes = string.as_bytes();
+                        let restore_data = obj.encode();
+                        let bytes = restore_data.as_bytes();
                         let end = bytes.len();
 
                         let result = [&end.to_be_bytes(), bytes].concat();
