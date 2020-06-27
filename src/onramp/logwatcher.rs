@@ -19,11 +19,8 @@ use std::{thread, time};
 
 use crate::errors::Result;
 use crate::ramp;
-use memmap::MmapMut;
-use memmap::MmapOptions;
 use simd_json::prelude::*;
 use std::collections::HashMap;
-use std::ops::DerefMut;
 use std::path::Path;
 
 mod config;
@@ -41,8 +38,6 @@ use process::HandlerInfo;
 use process::ProcessInfo;
 use restore::RestoreState;
 use simd_json::json;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -80,30 +75,31 @@ fn onramp_loop(
     };
 
     info!("starting logwatcher");
-    let (mut store, mut obj, restore_state) = if Path::new(&config.restore_file.path).exists() {
-        let (store, obj) = read_mmap(config.restore_file.clone())?;
-
-        let restore_state = RestoreState::from_json(obj.encode());
-
-        let restore_state = match restore_state {
-            Ok(rs) => rs,
-            Err(err) => {
-                error!(
-                    "restoring state from {}: {:?}",
-                    config.restore_file.path, err
-                );
-                RestoreState::empty()
-            }
-        };
-
-        (store, obj, restore_state)
-    } else {
-        let (store, obj) = create_mmap(config.restore_file.clone())?;
-        (store, obj, RestoreState::empty())
+    let obj = simd_json::OwnedValue::object();
+    let mut cache = match ramp::lookup("mmap_restore_file", Some(config.restore_file.clone()), &obj)
+    {
+        Ok(v) => v,
+        Err(e) => return Err(e),
     };
 
-    let eviction_interval = Duration::from_secs(60);
+    let obj = match cache.get() {
+        Ok(v) => v,
+        Err(e) => return Err(e),
+    };
+
+    let restore_state = match RestoreState::from_json(obj.encode()) {
+        Ok(rs) => rs,
+        Err(err) => {
+            error!(
+                "restoring state from {}: {:?}",
+                config.restore_file.path, err
+            );
+            RestoreState::empty()
+        }
+    };
+
     if let Ok(source_spec) = config.source.to_source_spec() {
+        let eviction_interval = source_spec.eviction_interval;
         let (_walker_sender, _source_sender, _join_handles) =
             start_all(content_sender, source_spec, restore_state);
 
@@ -115,27 +111,37 @@ fn onramp_loop(
                 PipeHandlerResult::Normal => (),
             }
 
-            // TODO clear obj of deleted files
             if last_eviction.is_none() || last_eviction.unwrap().elapsed() > eviction_interval {
                 info!("checking files to remove from restore");
+                let mut obj = match cache.get() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        metrics_reporter.increment_error();
+                        warn!("Failed to fetching from cache: {}", e);
+                        continue;
+                    }
+                };
+
                 let mut restore_data = obj.encode();
                 let restore_data_kv: HashMap<&str, &str> =
                     simd_json::from_str(&mut restore_data).unwrap();
                 for (file_path, _) in restore_data_kv.iter() {
                     if !Path::new(&file_path).exists() {
                         match obj.remove(*file_path) {
-                            Ok(v) => info!("removed file {} from restore because was deleted {:?}", file_path, v),
+                            Ok(v) => info!(
+                                "removed file {} from restore because was deleted {:?}",
+                                file_path, v
+                            ),
                             Err(_) => error!("couldn't removed file {} from restore", file_path),
                         };
                     }
                 }
-                let restore_data = obj.encode();
-                let bytes = restore_data.as_bytes();
-                let end = bytes.len();
 
-                let result = [&end.to_be_bytes(), bytes].concat();
-
-                store.deref_mut().write_all(&result)?;
+                if let Err(e) = cache.set(obj) {
+                    metrics_reporter.increment_error();
+                    warn!("Could not set interval in cache: {}", e);
+                    continue;
+                }
 
                 last_eviction = Some(Instant::now());
             }
@@ -159,6 +165,15 @@ fn onramp_loop(
                         );
                         id += 1;
 
+                        let mut obj = match cache.get() {
+                            Ok(v) => v,
+                            Err(e) => {
+                                metrics_reporter.increment_error();
+                                warn!("Failed to fetching from cache: {}", e);
+                                continue;
+                            }
+                        };
+
                         match handler_info.to_line() {
                             Some(handler_info_line) => {
                                 if let Err(e) =
@@ -175,13 +190,10 @@ fn onramp_loop(
                             }
                         };
 
-                        let restore_data = obj.encode();
-                        let bytes = restore_data.as_bytes();
-                        let end = bytes.len();
-
-                        let result = [&end.to_be_bytes(), bytes].concat();
-
-                        store.deref_mut().write_all(&result)?;
+                        if let Err(e) = cache.set(obj) {
+                            metrics_reporter.increment_error();
+                            warn!("Could not set interval in cache: {}", e);
+                        }
 
                         if config.throttle > 0 {
                             thread::sleep(time::Duration::from_millis(config.throttle));
@@ -270,63 +282,4 @@ fn start_all(
     join_handles.push(source_handle);
 
     (walker_msg_sender, source_sender.clone(), join_handles)
-}
-
-fn read_mmap(config: ramp::Config) -> Result<(MmapMut, simd_json::value::owned::Value)> {
-    let file = OpenOptions::new()
-        .write(true)
-        .read(true)
-        .open(config.path)?;
-    file.set_len(config.size as u64)?;
-
-    let mmap = unsafe { MmapOptions::new().map(&file)? };
-    let mut store = mmap.make_mut()?;
-
-    let byteslen = &mut store[0..8];
-    let mut array = [0; 8];
-    let byteslen = &byteslen[..array.len()];
-    array.copy_from_slice(byteslen);
-
-    let len = usize::from_be_bytes(array);
-
-    let mut bytes = &mut store[8..(len + 8)];
-    let obj = simd_json::to_owned_value(&mut bytes)?;
-
-    Ok((store, obj))
-}
-
-fn create_mmap(config: ramp::Config) -> Result<(MmapMut, simd_json::value::owned::Value)> {
-    let obj = simd_json::OwnedValue::object();
-    let p = Path::new(&config.path);
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(p)?;
-    file.set_len(config.size as u64)?;
-    let _len = config.size as usize;
-    let string = obj.encode();
-    let bytes = string.as_bytes();
-    let end = bytes.len();
-
-    let result = [&end.to_be_bytes(), bytes].concat();
-    file.write_all(&result)?;
-
-    let mmap = unsafe { MmapOptions::new().map(&file)? };
-    let store = mmap.make_mut()?;
-    Ok((store, obj))
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::errors::Result;
-    use std::fs;
-
-    #[test]
-    fn check_files() -> Result<()> {
-        assert_eq!(fs::metadata("/tmp/noexists").is_ok(), true);
-        let logwatcher_restore = fs::metadata("/tmp/logwatcher.json");
-        assert_eq!(logwatcher_restore.is_ok(), true);
-        Ok({})
-    }
 }

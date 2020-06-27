@@ -54,6 +54,7 @@ impl RestoreState {
     }
 
     pub fn from_json(mut restore_data: String) -> Result<RestoreState, Error> {
+        info!("Restore data from json {}", restore_data);
         let mut handler_infos = HashMap::new();
 
         let restore_data_kv: HashMap<&str, &str> = simd_json::from_str(&mut restore_data).unwrap();

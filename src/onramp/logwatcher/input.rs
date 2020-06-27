@@ -176,15 +176,15 @@ impl FileState {
                     let now = (nanotime() / 1_000_000) as u64;
 
                     let file_modified_ts = self
-                            .modified
-                            .duration_since(UNIX_EPOCH)
-                            .expect("time went backwards")
-                            .as_millis() as u64;
+                        .modified
+                        .duration_since(UNIX_EPOCH)
+                        .expect("time went backwards")
+                        .as_millis() as u64;
                     let file_created_ts = self
-                            .created
-                            .duration_since(UNIX_EPOCH)
-                            .expect("time went backwards")
-                            .as_millis() as u64;
+                        .created
+                        .duration_since(UNIX_EPOCH)
+                        .expect("time went backwards")
+                        .as_millis() as u64;
 
                     let id_str = format!(
                         "{}{}{}{}{}",
