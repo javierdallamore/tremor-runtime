@@ -40,6 +40,12 @@ pub struct MmapAnon {
     pub end: usize,
     pub len: usize,
 }
+pub struct MmapRestoreFile {
+    pub config: Config,
+    pub store: memmap::MmapMut,
+    pub len: usize,
+    pub end: usize,
+}
 
 impl MmapFile {
     fn as_mut_slice(&mut self) -> &mut [u8] {
@@ -58,6 +64,13 @@ impl MmapAnon {
 
     fn flush(&mut self) -> io::Result<()> {
         self.store.flush()
+    }
+}
+
+impl MmapRestoreFile {
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        let obj_start = 8;
+        &mut self.store[obj_start..self.end]
     }
 }
 
@@ -108,6 +121,31 @@ impl KV for MmapAnon {
         self.end = bytes.len();
         self.as_mut_slice().copy_from_slice(bytes);
         self.flush()?;
+
+        Ok(())
+    }
+}
+
+impl KV for MmapRestoreFile {
+    fn get(&mut self) -> Result<simd_json::OwnedValue> {
+        let obj = simd_json::to_owned_value(self.as_mut_slice())?;
+
+        Ok(obj)
+    }
+
+    fn set(&mut self, obj: simd_json::OwnedValue) -> Result<()> {
+        let string = obj.encode();
+        let bytes = string.as_bytes();
+        let obj_len = bytes.len();
+        let full_bytes = [&obj_len.to_be_bytes(), bytes].concat();
+
+        if full_bytes.len() > self.len {
+            return Err("object too large to store in memory-mapped file".into());
+        }
+
+        self.end = full_bytes.len();
+
+        self.store.deref_mut().write_all(&full_bytes)?;
 
         Ok(())
     }
@@ -172,6 +210,74 @@ impl MmapFile {
     }
 }
 
+impl MmapRestoreFile {
+    fn load_from_file(config: Config) -> Result<Box<dyn KV>> {
+        let p = Path::new(&config.path);
+        let file = OpenOptions::new().read(true).write(true).open(p)?;
+        file.set_len(config.size as u64)?;
+        let len = config.size as usize;
+
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
+        let mut store = mmap.make_mut()?;
+
+        let obj_start = 8;
+        let obj_len_bytes = &mut store[0..obj_start];
+        let mut array = [0; 8];
+        let obj_len = &obj_len_bytes[..array.len()];
+        array.copy_from_slice(obj_len);
+
+        let obj_size = usize::from_be_bytes(array);
+        let end = obj_start + obj_size;
+
+        Ok(Box::new(Self {
+            config,
+            store,
+            len,
+            end,
+        }))
+    }
+
+    fn create_file(config: Config, obj: &simd_json::OwnedValue) -> Result<Box<dyn KV>> {
+        let p = Path::new(&config.path);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(p)?;
+        file.set_len(config.size as u64)?;
+        let len = config.size as usize;
+        let string = obj.encode();
+        let bytes = string.as_bytes();
+
+        let obj_len = bytes.len();
+        let full_bytes = [&obj_len.to_be_bytes(), bytes].concat();
+        file.write_all(&full_bytes)?;
+        let end = full_bytes.len();
+
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
+        let store = mmap.make_mut()?;
+
+        Ok(Box::new(Self {
+            config,
+            store,
+            len,
+            end,
+        }))
+    }
+
+    fn from_config(config: Option<Config>, obj: &simd_json::OwnedValue) -> Result<Box<dyn KV>> {
+        if let Some(config) = config {
+            if Path::new(&config.path).exists() {
+                MmapRestoreFile::load_from_file(config)
+            } else {
+                MmapRestoreFile::create_file(config, obj)
+            }
+        } else {
+            Err("Missing config for mmap".into())
+        }
+    }
+}
+
 #[cfg_attr(tarpaulin, skip)]
 pub fn lookup(
     name: &str,
@@ -181,6 +287,7 @@ pub fn lookup(
     match name {
         "mmap_file" => MmapFile::from_config(config, &obj),
         "mmap_anon" => MmapAnon::from_config(config, &obj),
+        "mmap_restore_file" => MmapRestoreFile::from_config(config, &obj),
         _ => Err(format!("Cache {} not known", name).into()),
     }
 }
@@ -252,6 +359,34 @@ mod tests {
             mmap.set(obj3).is_err(),
             "object too large to store in memory-mapped file"
         );
+
+        drop(file);
+        dir.close().unwrap();
+    }
+
+    #[test]
+    fn test_mmap_restore_file() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("restore.json");
+        let file = File::create(file_path.clone()).unwrap();
+        let config = Config {
+            path: file_path.as_path().to_string_lossy().to_string(),
+            size: 96,
+        };
+        let opt = std::option::Option::from(config);
+        let mut data = "{\"file_info\": \"info\"}".to_string();
+        let bytes = unsafe { data.as_bytes_mut() };
+        let obj = simd_json::to_owned_value(bytes).unwrap();
+        let exp_obj = obj.clone();
+        let mut mmap =
+            MmapFile::from_config(opt, &obj).expect("To create file-backed restore memory map");
+
+        assert_eq!(mmap.get().expect("To retrieve object"), exp_obj);
+
+        let mut data2 = "{\"file_info\": \"info2\"}".to_string();
+        let bytes2 = unsafe { data2.as_bytes_mut() };
+        let exp_obj2 = simd_json::to_owned_value(bytes2).unwrap();
+        assert_ne!(mmap.get().expect("To retrieve object"), exp_obj2);
 
         drop(file);
         dir.close().unwrap();

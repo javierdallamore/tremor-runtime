@@ -15,7 +15,13 @@
 use crate::onramp::prelude::*;
 use serde_yaml::Value;
 //use std::process;
-use std::thread;
+use std::{thread, time};
+
+use crate::errors::Result;
+use crate::ramp;
+use simd_json::prelude::*;
+use std::collections::HashMap;
+use std::path::Path;
 
 mod config;
 mod handlers;
@@ -28,13 +34,12 @@ extern crate serde_humanize_rs;
 use config::{Config, SourceSpec};
 use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
 use input::Content;
+use process::HandlerInfo;
 use process::ProcessInfo;
 use restore::RestoreState;
 use simd_json::json;
-use std::fs::OpenOptions;
-use std::io::{LineWriter, Write};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct LogWatcher {
     pub config: Config,
@@ -60,7 +65,7 @@ fn onramp_loop(
 ) -> Result<()> {
     let mut pipelines: Vec<(TremorURL, pipeline::Addr)> = Vec::new();
     let mut id = 0;
-    let (content_sender, content_receiver) = bounded(0);
+    let (content_sender, content_receiver) = bounded(100);
 
     let origin_uri = tremor_pipeline::EventOriginUri {
         scheme: "tremor-logwatcher".to_string(),
@@ -70,23 +75,14 @@ fn onramp_loop(
     };
 
     info!("starting logwatcher");
-
-    info!("get file consumed state from file");
-    let restore_state = match &config.restore_file {
-        Some(path) => match RestoreState::from_file(&path) {
-            Ok(rs) => rs,
-            Err(err) => {
-                error!("restoring state from {}: {:?}", path, err);
-                RestoreState::empty()
-            }
-        },
-        None => RestoreState::empty(),
-    };
+    let (mut cache, restore_state) = load_restore_file(config.restore_file.clone())?;
 
     if let Ok(source_spec) = config.source.to_source_spec() {
-        let (walker_sender, source_sender, join_handles) =
+        let eviction_interval = source_spec.eviction_interval;
+        let (_walker_sender, _source_sender, _join_handles) =
             start_all(content_sender, source_spec, restore_state);
 
+        let mut last_eviction: Option<Instant> = None;
         loop {
             match task::block_on(handle_pipelines(&rx, &mut pipelines, &mut metrics_reporter))? {
                 PipeHandlerResult::Retry => continue,
@@ -94,8 +90,15 @@ fn onramp_loop(
                 PipeHandlerResult::Normal => (),
             }
 
-            match content_receiver.recv_timeout(Duration::from_millis(1000)) {
-                Ok(content) => {
+            if let Err(e) =
+                evict_removed_files_from_restore(&mut cache, eviction_interval, &mut last_eviction)
+            {
+                metrics_reporter.increment_error();
+                warn!("evict removed file from restore error: {}", e);
+            };
+
+            match content_receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok((content, handler_info)) => {
                     let data = simd_json::to_vec(&json!(content));
 
                     let mut ingest_ns = nanotime();
@@ -112,32 +115,22 @@ fn onramp_loop(
                             data,
                         );
                         id += 1;
+
+                        if let Err(e) = update_restore_file(&mut cache, content, handler_info) {
+                            error!("failed to update restore file: {}", e);
+                        }
+
+                        if config.throttle > 0 {
+                            thread::sleep(time::Duration::from_millis(config.throttle));
+                        }
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => trace!("recv timeout"),
                 Err(error) => {
-                    error!("{}", error);
-                    // TODO until I discover how to subscribe to process kill and call the methods bellow
-                    break;
+                    error!("Request error {}", error);
                 }
             }
         }
-
-        // TODO I do not know how where stop all and store file state before closing
-        info!("stopping everything and saving state");
-
-        match walker_sender.send(path::WalkerMsg::Stop) {
-            Ok(_) => info!("ok sending stop signal to walker"),
-            Err(err) => error!("Error sending stop signal to walker: {}", err),
-        }
-
-        match source_sender.send(handlers::Msg::Stop) {
-            Ok(_) => info!("ok sending stop signal to source"),
-            Err(err) => error!("error sending stop signal to source: {}", err),
-        }
-
-        wait_all(join_handles, config.restore_file.clone());
-        info!("all threads finished, exiting");
     }
     Ok(())
 }
@@ -168,7 +161,7 @@ impl Onramp for LogWatcher {
 }
 
 fn start_all(
-    content_sender: Sender<Content>,
+    content_sender: Sender<(Content, HandlerInfo)>,
     source: SourceSpec,
     restore_state: RestoreState,
 ) -> (
@@ -216,66 +209,67 @@ fn start_all(
     (walker_msg_sender, source_sender.clone(), join_handles)
 }
 
-struct LogWrite;
-
-impl LogWrite {
-    fn new() -> LogWrite {
-        LogWrite {}
+fn update_restore_file(
+    cache: &mut Box<dyn ramp::KV>,
+    content: Content,
+    handler_info: HandlerInfo,
+) -> Result<()> {
+    let mut obj = cache.get()?;
+    let handler_info_line = handler_info.to_line();
+    if let Err(e) = obj.insert(content.file_path, handler_info_line) {
+        return Err(format!("Could not insert into obj: {}", e).into());
     }
+
+    cache.set(obj)?;
+    Ok(())
 }
 
-impl std::io::Write for LogWrite {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match std::str::from_utf8(buf) {
-            Ok(s) => {
-                info!("{}", s);
-                Ok(buf.len())
-            }
-            Err(_) => Ok(0),
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn wait_all(join_handles: Vec<JoinHandle<ProcessInfo>>, restore_path: Option<String>) {
-    let mut writer = match restore_path {
-        Some(file_path) => match OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&file_path)
-        {
-            Ok(write_file) => LineWriter::new(Box::new(write_file) as Box<dyn Write>),
-            Err(err) => {
-                error!("can't open restore file {}: {}", file_path, err);
-                LineWriter::new(Box::new(LogWrite::new()) as Box<dyn Write>)
-            }
-        },
-        None => LineWriter::new(Box::new(LogWrite::new()) as Box<dyn Write>),
+fn load_restore_file(config: ramp::Config) -> Result<(Box<dyn ramp::KV>, RestoreState)> {
+    info!("loading restore file");
+    let obj = simd_json::OwnedValue::object();
+    let mut cache = match ramp::lookup("mmap_restore_file", Some(config.clone()), &obj) {
+        Ok(v) => v,
+        Err(e) => return Err(e),
     };
-    for handle in join_handles {
-        match handle.join() {
-            Ok(ProcessInfo::Nothing) => {
-                info!("no process info");
+
+    let obj = cache.get()?;
+    let restore_state = match RestoreState::from_json(obj.encode()) {
+        Ok(rs) => rs,
+        Err(err) => {
+            error!("restoring state from {}: {:?}", config.path, err);
+            RestoreState::empty()
+        }
+    };
+
+    Ok((cache, restore_state))
+}
+
+fn evict_removed_files_from_restore(
+    cache: &mut Box<dyn ramp::KV>,
+    eviction_interval: Duration,
+    last_eviction: &mut Option<Instant>,
+) -> Result<()> {
+    if last_eviction.is_none() || last_eviction.unwrap().elapsed() > eviction_interval {
+        info!("checking files to remove from restore");
+        *last_eviction = Some(Instant::now());
+
+        let mut obj = cache.get()?;
+
+        let mut restore_data = obj.encode();
+        let restore_data_kv: HashMap<&str, &str> = simd_json::from_str(&mut restore_data).unwrap();
+        for (file_path, _) in restore_data_kv.iter() {
+            if !Path::new(&file_path).exists() {
+                match obj.remove(*file_path) {
+                    Ok(v) => info!(
+                        "removed file {} from restore because was deleted {:?}",
+                        file_path, v
+                    ),
+                    Err(_) => error!("couldn't removed file {} from restore", file_path),
+                };
             }
-            Ok(ProcessInfo::HandlerInfo(infos)) => {
-                for info in infos {
-                    if let Some(line) = info.to_line() {
-                        match writer.write_all(line.as_bytes()) {
-                            Ok(_) => {
-                                info!("restore written for file {}", info.path);
-                            }
-                            Err(err) => {
-                                error!("{}", err);
-                            }
-                        }
-                    }
-                }
-            }
-            Err(err) => error!("stop error: {:?}", err),
-        };
+        }
+
+        cache.set(obj)?;
     }
+    Ok(())
 }

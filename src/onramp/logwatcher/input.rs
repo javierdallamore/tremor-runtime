@@ -19,6 +19,7 @@ pub struct Content {
     pub file_offset: u64,
     pub line_consumed_ts: u64,
     pub line: String,
+    pub id: String,
 }
 
 #[derive(Debug)]
@@ -66,7 +67,7 @@ pub struct FileState {
     // state and reopen to start reading from the new one
     reset_on_eof: bool,
     file_lines: Vec<String>,
-    content_sender: Sender<Content>,
+    content_sender: Sender<(Content, HandlerInfo)>,
 }
 
 #[derive(Debug)]
@@ -124,7 +125,7 @@ impl FileState {
         modified: SystemTime,
         created: SystemTime,
         checksum: ContentChecksum,
-        content_sender: Sender<Content>,
+        content_sender: Sender<(Content, HandlerInfo)>,
     ) -> FileState {
         FileState {
             path,
@@ -174,27 +175,40 @@ impl FileState {
                 Ok(Some(line)) => {
                     let now = (nanotime() / 1_000_000) as u64;
 
+                    let file_modified_ts = self
+                        .modified
+                        .duration_since(UNIX_EPOCH)
+                        .expect("time went backwards")
+                        .as_millis() as u64;
+                    let file_created_ts = self
+                        .created
+                        .duration_since(UNIX_EPOCH)
+                        .expect("time went backwards")
+                        .as_millis() as u64;
+
+                    let id_str = format!(
+                        "{}{}{}{}{}",
+                        file_created_ts,
+                        hostname(),
+                        self.path,
+                        self.offset,
+                        line
+                    );
+
                     let content = Content {
                         hostname: hostname(),
                         file_path: self.path.clone(),
-                        file_modified_ts: self
-                            .modified
-                            .duration_since(UNIX_EPOCH)
-                            .expect("time went backwards")
-                            .as_millis() as u64,
-                        file_created_ts: self
-                            .created
-                            .duration_since(UNIX_EPOCH)
-                            .expect("time went backwards")
-                            .as_millis() as u64,
+                        file_modified_ts: file_modified_ts,
+                        file_created_ts: file_created_ts,
                         file_offset: self.offset,
                         line_consumed_ts: now,
                         line: line,
+                        id: hash_str(&id_str),
                     };
 
                     has_more = true;
                     line_count += 1;
-                    match self.content_sender.send(content) {
+                    match self.content_sender.send((content, self.to_info())) {
                         Ok(_) => {}
                         Err(error) => {
                             error!("error sending content: {}", error);
@@ -230,7 +244,6 @@ impl FileState {
                         if self.buffer.ends_with("\n") {
                             self.buffer.pop();
                             let content = self.buffer.clone();
-                            self.file_lines.push(self.buffer.clone());
 
                             let content_offset = self.offset - (content.len() + 1) as u64;
                             self.checksum = ContentChecksum::Read {
@@ -238,14 +251,16 @@ impl FileState {
                                 offset: content_offset,
                             };
 
-                            let lines_joined = self.file_lines.join("\n");
-
-                            let mut result = String::from("");
-                            let mut keep_last_line = false;
-
                             if line_regex.is_empty() {
-                                result = self.buffer.clone();
+                                let result = self.buffer.clone();
+                                self.buffer.clear();
+                                Ok(Some(result))
                             } else {
+                                //TODO find a better way for multiple lines accumulator
+                                let mut result = String::from("");
+                                let mut keep_last_line = false;
+                                self.file_lines.push(self.buffer.clone());
+                                let lines_joined = self.file_lines.join("\n");
                                 'outer: for regex in &line_regex {
                                     for mat in regex.regex.find_iter(&lines_joined) {
                                         keep_last_line = regex.keep_last_line;
@@ -253,21 +268,22 @@ impl FileState {
                                         break 'outer;
                                     }
                                 }
-                            }
-                            if !result.is_empty() {
-                                self.file_lines.clear();
-                                if keep_last_line {
-                                    self.file_lines = vec![self.buffer.clone()];
+
+                                if !result.is_empty() {
+                                    self.file_lines.clear();
+                                    if keep_last_line {
+                                        self.file_lines = vec![self.buffer.clone()];
+                                    }
                                 }
-                            }
 
-                            // remove lines while file_lines > max_lines
-                            while self.file_lines.len() > max_lines {
-                                self.file_lines.remove(0);
-                            }
+                                // remove lines while file_lines > max_lines
+                                while self.file_lines.len() > max_lines {
+                                    self.file_lines.remove(0);
+                                }
 
-                            self.buffer.clear();
-                            Ok(Some(result))
+                                self.buffer.clear();
+                                Ok(Some(result))
+                            }
                         } else {
                             Ok(None)
                         }

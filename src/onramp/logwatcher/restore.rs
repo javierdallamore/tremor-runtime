@@ -10,6 +10,7 @@ pub struct RestoreState {
 
 #[derive(Debug)]
 pub enum Error {
+    #[allow(dead_code)]
     NotFound(String),
 }
 
@@ -20,6 +21,7 @@ impl RestoreState {
         }
     }
 
+    #[allow(dead_code)]
     pub fn from_file(path: &str) -> Result<RestoreState, Error> {
         let mut handler_infos = HashMap::new();
         match File::open(path) {
@@ -49,6 +51,24 @@ impl RestoreState {
                 Err(Error::NotFound(path.to_string()))
             }
         }
+    }
+
+    pub fn from_json(mut restore_data: String) -> Result<RestoreState, Error> {
+        info!("Restore data from json {}", restore_data);
+        let mut handler_infos = HashMap::new();
+
+        let restore_data_kv: HashMap<&str, &str> = simd_json::from_str(&mut restore_data).unwrap();
+        for (_k, v) in restore_data_kv.iter() {
+            match ProcessInfoItem::from_line(&v) {
+                ProcessInfoItem::HandlerInfo(handler_info) => {
+                    handler_infos.insert(handler_info.path.clone(), handler_info);
+                }
+                ProcessInfoItem::Unk(unk_line) => {
+                    debug!("unknown restore state line: {}", unk_line);
+                }
+            }
+        }
+        Ok(RestoreState { handler_infos })
     }
 
     pub fn get_handler_state(&self, path: &str) -> Option<&HandlerInfo> {

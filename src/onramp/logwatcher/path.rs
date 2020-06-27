@@ -336,13 +336,13 @@ impl ChangeWatcher {
                 if last_check.is_none() || last_check.unwrap().elapsed() > check_inverval {
                     last_check = Some(Instant::now());
                     self.check(&s);
-                    trace!("check in {:?}", last_check.unwrap().elapsed());
+                    debug!("check in {:?}", last_check.unwrap().elapsed());
                 }
 
                 if last_eviction.is_none() || last_eviction.unwrap().elapsed() > eviction_interval {
                     last_eviction = Some(Instant::now());
                     self.evict_inactive(evict_older_than);
-                    trace!("evict in {:?}", last_eviction.unwrap().elapsed());
+                    debug!("evict in {:?}", last_eviction.unwrap().elapsed());
                 }
             }
         })
@@ -372,7 +372,7 @@ impl ChangeState {
             Ok(v) => v,
             // trace since this fails on linux
             Err(err) => {
-                trace!("error getting created from metadata {}", err);
+                error!("error getting created from metadata {}", err);
                 self.created
             }
         };
@@ -392,18 +392,21 @@ impl ChangeState {
             Ok(Some(handlers::Msg::CreatedChange(
                 path.to_string(),
                 len,
+                created,
                 modified,
             )))
         } else if len < current_len {
             Ok(Some(handlers::Msg::SizeSmaller(
                 path.to_string(),
                 len,
+                created,
                 modified,
             )))
         } else if modified > current_modified {
             Ok(Some(handlers::Msg::ModifiedChange(
                 path.to_string(),
                 len,
+                created,
                 modified,
             )))
         } else {
