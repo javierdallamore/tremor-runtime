@@ -372,7 +372,9 @@ impl ChangeState {
             Ok(v) => v,
             // trace since this fails on linux
             Err(err) => {
-                error!("error getting created from metadata {}", err);
+                if (len == 0) {
+                    error!("error getting created from metadata {}", err);
+                }
                 self.created
             }
         };
