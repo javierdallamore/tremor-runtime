@@ -53,6 +53,7 @@ pub struct ChangeWatcher {
 struct ChangeState {
     modified: SystemTime,
     created: SystemTime,
+    use_created: bool,
     len: u64,
 }
 
@@ -354,6 +355,7 @@ impl ChangeState {
         ChangeState {
             modified: UNIX_EPOCH,
             created: UNIX_EPOCH,
+            use_created: true,
             len: 0,
         }
     }
@@ -363,20 +365,24 @@ impl ChangeState {
             modified: handler_info.modified,
             created: handler_info.created,
             len: handler_info.len,
+            use_created: true,
         }
     }
 
     fn check(&mut self, path: &str) -> io::Result<Option<handlers::Msg>> {
         let metadata = fs::metadata(path)?;
-        let created = match metadata.created() {
-            Ok(v) => v,
-            // trace since this fails on linux
-            Err(err) => {
-                if (len == 0) {
+        let created = if self.use_created {
+            match metadata.created() {
+                Ok(v) => v,
+                Err(err) => {
+                    // trace since this fails on some linux. Log it only first time checking path
                     error!("error getting created from metadata {}", err);
+                    self.use_created = false;
+                    self.created
                 }
-                self.created
             }
+        } else {
+            self.created
         };
 
         let len = metadata.len();
