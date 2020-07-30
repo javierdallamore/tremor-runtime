@@ -37,6 +37,7 @@ mod gcs;
 #[cfg(feature = "gcp")]
 mod gpub;
 mod kafka;
+mod newrelic;
 mod postgres;
 mod prelude;
 mod rest;
@@ -95,6 +96,7 @@ pub fn lookup(name: &str, config: &Option<OpConfig>) -> Result<Box<dyn Offramp>>
         #[cfg(feature = "gcp")]
         "gpub" => gpub::GPub::from_config(config),
         "kafka" => kafka::Kafka::from_config(config),
+        "newrelic" => newrelic::NewRelic::from_config(config),
         "postgres" => postgres::Postgres::from_config(config),
         "rest" => rest::Rest::from_config(config),
         "stdout" => stdout::StdOut::from_config(config),
