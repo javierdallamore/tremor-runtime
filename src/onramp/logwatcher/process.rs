@@ -161,8 +161,8 @@ impl ProcessInfoItem {
                     // since they match they are available and have the right format
                     let len_str = captures.get(1).unwrap().as_str();
                     let offset_str = captures.get(2).unwrap().as_str();
-                    let modified_millis_since_epoch_str = captures.get(3).unwrap().as_str();
-                    let created_millis_since_epoch_str = captures.get(4).unwrap().as_str();
+                    let modified_nanos_since_epoch_str = captures.get(3).unwrap().as_str();
+                    let created_nanos_since_epoch_str = captures.get(4).unwrap().as_str();
                     let hash = captures.get(5).unwrap().as_str();
                     let hash_offset_str = captures.get(6).unwrap().as_str();
                     let hash_content_len_str = captures.get(7).unwrap().as_str();
@@ -170,15 +170,15 @@ impl ProcessInfoItem {
 
                     let len = len_str.parse::<u64>().unwrap();
                     let offset = offset_str.parse::<u64>().unwrap();
-                    let modified_millis_since_epoch =
-                        modified_millis_since_epoch_str.parse::<u64>().unwrap();
+                    let modified_nanos_since_epoch =
+                        modified_nanos_since_epoch_str.parse::<u64>().unwrap();
                     let modified = UNIX_EPOCH
-                        .checked_add(Duration::from_nanos(modified_millis_since_epoch))
+                        .checked_add(Duration::from_nanos(modified_nanos_since_epoch))
                         .unwrap();
-                    let created_millis_since_epoch =
-                        created_millis_since_epoch_str.parse::<u64>().unwrap();
+                    let created_nanos_since_epoch =
+                        created_nanos_since_epoch_str.parse::<u64>().unwrap();
                     let created = UNIX_EPOCH
-                        .checked_add(Duration::from_nanos(created_millis_since_epoch))
+                        .checked_add(Duration::from_nanos(created_nanos_since_epoch))
                         .unwrap();
                     let hash_offset = hash_offset_str.parse::<u64>().unwrap();
                     let hash_content_len = hash_content_len_str.parse::<usize>().unwrap();
